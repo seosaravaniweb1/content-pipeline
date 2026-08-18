@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>پنل خوراک محتوایی</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📊</text></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <strong>خوراک محتوایی</strong>
+    <span class="muted" id="topicLabel"></span>
+  </div>
+  <div class="head-actions">
+    <select id="runSelect" title="اجرای فعال"></select>
+    <button id="newRunBtn" class="primary">اجرای جدید</button>
+    <button id="deleteRunBtn" class="danger ghost" title="حذف کامل این اجرا">حذف</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="setup" class="active">شروع</button>
+  <button data-tab="dashboard">داشبورد</button>
+  <button data-tab="run">اجرا</button>
+  <button data-tab="products">محصولات</button>
+  <button data-tab="review">بازبینی دستی</button>
+  <button data-tab="config">تنظیمات</button>
+  <button data-tab="tools">ابزار</button>
+</nav>
+
+<div id="toast" hidden></div>
+
+<main>
+  <!-- --------------------------------------------------------- شروع -->
+  <section id="tab-setup" class="tab active">
+    <div class="panel">
+      <h2>۱. چه نوع محصولاتی می‌خواهید؟</h2>
+      <p class="muted">
+        هر تیک یک دسته است و می‌توانید چند تا را با هم بزنید. عنوان‌های پیداشده
+        به نزدیک‌ترین دسته نسبت داده می‌شوند و همان نام در ستون «دسته»ی خروجی می‌آید.
+      </p>
+      <div id="presetList" class="preset-grid"></div>
+      <div class="row">
+        <input id="customCategory" placeholder="دسته‌ی دلخواه خودتان (اختیاری) — مثلاً: کتاب صوتی">
+        <button id="addCategory" class="ghost">افزودن</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>۲. سایت‌های رقیب</h2>
+      <p class="muted">
+        هر خط یک آدرس. تکراری‌ها خودشان حذف می‌شوند. <span id="siteLimit"></span>
+      </p>
+      <div class="warn">
+        <b>دو شکل آدرس، دو رفتار متفاوت:</b><br>
+        <code dir="ltr">https://shop.ir</code> — کل سایت از روی sitemap گشته می‌شود.<br>
+        <code dir="ltr">https://shop.ir/?s=رمان</code> یا <code dir="ltr">https://shop.ir/category/roman/</code>
+        — فقط لینک‌های همان فهرست و صفحه‌های بعدی‌اش.
+        <b>وقتی سایت دسته‌بندی درست‌وحسابی ندارد، خودتان داخلش سرچ کنید و آدرس
+        نتایج را اینجا بگذارید.</b>
+      </div>
+      <textarea id="sitesText" dir="ltr" spellcheck="false"
+                placeholder="https://example1.ir&#10;https://example2.ir&#10;example3.com"></textarea>
+      <div class="row">
+        <span class="muted" id="siteCount"></span>
+        <span class="spacer"></span>
+        <span class="muted" id="planSource"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>۳. تنظیمات این اجرا</h2>
+      <div class="row wrap">
+        <label>حداکثر محصول از هر منبع:
+          <input id="maxProducts" type="number" min="0" step="1" value="0" style="width:6rem">
+        </label>
+        <span class="muted">۰ یعنی بدون سقف. برای امتحان اول، ۱۰ بگذارید.</span>
+      </div>
+      <div class="row wrap">
+        <label><input id="requireProduct" type="checkbox" checked>
+          فقط صفحه‌هایی که واقعاً محصول‌اند (قیمت / افزودن به سبد)</label>
+      </div>
+      <div class="row wrap">
+        <label><input id="forceJs" type="checkbox">
+          این سایت‌ها با جاوااسکریپت رندر می‌شوند (React / Vue / Angular)</label>
+        <span class="muted">نیازمند Playwright</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>۴. کدام خروجی را می‌خواهید؟</h2>
+      <p class="muted">
+        در شیت «همه محصولات» ستونی هست که می‌گوید هر محصول ساجست دارد یا نه —
+        پس حتی اگر همه را یکجا بخواهید، تفکیک از دست نمی‌رود.
+      </p>
+      <div id="sheetList" class="phase-list"></div>
+    </div>
+
+    <div class="panel">
+      <div class="row wrap">
+        <button id="createRunBtn" class="primary">ساخت اجرای جدید با این تنظیمات</button>
+        <button id="savePlanBtn" class="ghost">ذخیره روی اجرای فعلی</button>
+        <span class="spacer"></span>
+        <button id="goRunBtn" class="ghost">رفتن به تب اجرا ◀</button>
+      </div>
+      <div id="setupSummary" class="muted"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------ داشبورد -->
+  <section id="tab-dashboard" class="tab">
+    <div class="cards" id="counterCards"></div>
+    <div class="panel">
+      <h2>وضعیت اجرا</h2>
+      <table class="kv" id="runInfo"></table>
+    </div>
+    <div class="panel">
+      <h2>دانلود خروجی</h2>
+      <p class="muted">
+        هر فهرست را جداگانه یا همه را در یک فایل بگیرید. خروجی همین لحظه از
+        دیتابیس ساخته می‌شود، پس ادغام‌های دستی شما هم در آن هست.
+      </p>
+      <div id="downloadList"></div>
+      <div id="outputInfo" class="muted"></div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- اجرا -->
+  <section id="tab-run" class="tab">
+    <div class="panel">
+      <h2>اجرای فازها</h2>
+      <p class="muted">
+        فازها مستقل‌اند و از طریق دیتابیس با هم حرف می‌زنند. هر فاز بلافاصله می‌نویسد،
+        پس اگر وسط کار متوقف شود، از همان فاز می‌توانید ادامه بدهید.
+      </p>
+      <div id="phaseChecks" class="phase-list"></div>
+      <div class="row">
+        <button id="startBtn" class="primary">اجرا</button>
+        <button id="cancelBtn" class="danger" disabled>لغو</button>
+        <span id="jobStatus" class="muted"></span>
+      </div>
+      <div class="warn" id="suggestWarn" hidden>
+        فاز ۳ به endpoint غیررسمی گوگل می‌زند. بار اول با
+        <code>max_per_session: 10</code> امتحان کنید.
+      </div>
+    </div>
+    <div class="panel">
+      <h2>لاگ زنده</h2>
+      <pre id="log" dir="rtl"></pre>
+    </div>
+  </section>
+
+  <!-- ----------------------------------------------------- محصولات -->
+  <section id="tab-products" class="tab">
+    <div class="panel">
+      <div class="row wrap">
+        <select id="prodFilter">
+          <option value="all">همه</option>
+          <option value="merged">ادغام‌شده (بیش از یک عنوان)</option>
+          <option value="needs_review">نیازمند بازبینی</option>
+          <option value="has_suggest">دارای ساجست</option>
+          <option value="no_suggest">بدون ساجست</option>
+          <option value="pending">در صف ساجست</option>
+        </select>
+        <input id="prodSearch" type="search" placeholder="جستجو در عنوان…">
+        <span class="muted" id="prodCount"></span>
+        <span class="spacer"></span>
+        <button id="prodPrev" class="ghost">قبلی</button>
+        <button id="prodNext" class="ghost">بعدی</button>
+      </div>
+      <div id="mergeBar" class="mergebar" hidden></div>
+      <div class="scrollbox">
+      <table class="grid" id="prodTable">
+        <thead>
+          <tr>
+            <th style="width:2.2rem"></th>
+            <th>عنوان یکپارچه</th>
+            <th style="width:4rem">عنوان‌ها</th>
+            <th style="width:5rem">کلمات</th>
+            <th style="width:7rem">ساجست</th>
+            <th style="width:9rem">دامنه‌ها</th>
+            <th style="width:9rem"></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      </div>
+      <div class="row wrap" id="pager"></div>
+      <p class="muted">
+        ستون «ساجست»: <b>دارد</b> یعنی گوگل برایش پیشنهاد داشت،
+        <b>ندارد</b> یعنی پرسیدیم و پیشنهادی نبود،
+        <b>در صف</b> یعنی هنوز از گوگل پرسیده نشده — فاز ۳ را اجرا کنید.
+      </p>
+    </div>
+    <div class="panel" id="detailPanel" hidden>
+      <h2 id="detailTitle"></h2>
+      <div id="detailBody"></div>
+    </div>
+  </section>
+
+  <!-- ----------------------------------------------------- بازبینی -->
+  <section id="tab-review" class="tab">
+    <div class="panel">
+      <h2>محصولات علامت‌خورده</h2>
+      <p class="muted">
+        قانون طلایی: در حالت شک، ادغام نکن. یک ادغام اشتباه برگشت‌پذیر نیست مگر با «جدا کردن».
+        نویسنده مهم‌ترین نشانه‌ی هویت است.
+      </p>
+      <div id="reviewList"></div>
+    </div>
+    <div class="panel">
+      <h2>عنوان‌های مرزی</h2>
+      <p class="muted">
+        عنوان‌هایی که امتیاز موضوعی‌شان بین آستانه‌ی رد و پذیرش بود — ابزار
+        مطمئن نبود جزو دسته‌ی شما هستند یا نه، پس نه ردشان کرد نه وارد محصولات کرد.
+      </p>
+      <div id="borderlineList"></div>
+    </div>
+  </section>
+
+  <!-- ----------------------------------------------------- تنظیمات -->
+  <section id="tab-config" class="tab">
+    <div class="panel">
+      <h2>config.yaml</h2>
+      <div class="row">
+        <span class="muted" id="configPath"></span>
+        <span class="spacer"></span>
+        <button id="configReload" class="ghost">بازخوانی</button>
+        <button id="configSave" class="primary">ذخیره</button>
+      </div>
+      <p class="warn">
+        ذخیره، فایل را بازنویسی می‌کند و یک نسخه‌ی پشتیبان <code>.bak</code> می‌سازد.
+        توضیحات و ترتیب فعلی حفظ می‌شود چون متن را همان‌طور که هست ذخیره می‌کنیم.
+      </p>
+      <textarea id="configText" spellcheck="false" dir="ltr"></textarea>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- ابزار -->
+  <section id="tab-tools" class="tab">
+    <div class="panel">
+      <h2>آزمایش نرمال‌سازی (فاز ۰)</h2>
+      <p class="muted">
+        اینجا می‌بینید یک عنوان قبل از مقایسه چطور تمیز می‌شود. «تطبیق» همان چیزی
+        است که برای تشخیص تکراری‌ها استفاده می‌شود و «توکن‌ها» کلمات معنادار
+        باقی‌مانده‌اند. اگر ادغامی اشتباه شد، اول اینجا را نگاه کنید.
+      </p>
+      <div class="row">
+        <input id="normInput" placeholder="مثلاً: دانلود جزوه ریاضی ۱۴۰۴ PDF">
+        <button id="normBtn" class="primary">تحلیل</button>
+      </div>
+      <table class="kv" id="normOut"></table>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
