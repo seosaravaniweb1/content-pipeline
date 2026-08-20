@@ -84,6 +84,8 @@ class JobState:
     status: str = IDLE
     #: شیتی که در حال پر شدن است (برای نمایش در پنل)
     sheet: str = ""
+    #: حلقه‌ی خودکار روشن است؟
+    auto: bool = False
     error: str = ""
     summary: str = ""
     started_at: float = 0.0
@@ -93,6 +95,7 @@ class JobState:
         return {
             "status": self.status,
             "sheet": self.sheet,
+            "auto": self.auto,
             "error": self.error,
             "summary": self.summary,
             "started_at": self.started_at,
@@ -155,8 +158,12 @@ class JobRunner:
         return state
 
     # ------------------------------------------------------------------ کار
-    def start(self, options: Any, config: Config | None = None) -> None:
-        """شروع یک اجرای تکمیل در پس‌زمینه."""
+    def start(self, options: Any, config: Config | None = None, auto: bool = False) -> None:
+        """شروع یک اجرای تکمیل در پس‌زمینه.
+
+        ``auto`` یعنی حلقه‌ی خودکار: پر کن، بخواب، دوباره شیت را بخوان — تا
+        وقتی کاربر «لغو» بزند.
+        """
         with self._lock:
             if self._state.status == RUNNING:
                 raise JobBusy("یک اجرا در جریان است؛ اول آن را تمام یا لغو کنید.")
@@ -165,6 +172,7 @@ class JobRunner:
             self._state = JobState(
                 status=RUNNING,
                 sheet=options.sheet.tab or options.sheet.file or options.sheet.sheet_id,
+                auto=auto,
                 started_at=time.time(),
             )
             self._lines = []
@@ -172,7 +180,7 @@ class JobRunner:
             self._partial = ""
             self._cancel.clear()
         self._thread = threading.Thread(
-            target=self._worker, args=(options,), name="sheet-filler-job", daemon=True
+            target=self._worker, args=(options, auto), name="sheet-filler-job", daemon=True
         )
         self._thread.start()
 
@@ -199,26 +207,40 @@ class JobRunner:
             self._state.summary = summary
             self._state.finished_at = time.time()
 
-    def _worker(self, options: Any) -> None:
+    def _worker(self, options: Any, auto: bool = False) -> None:
         router = install_router()
         router.register(self._emit)
         conn = None
         try:
             conn = db.connect(self.config.db_path)
-            with http.fetcher_from_config(self.config) as fetcher:
-                if fetcher.backend != "curl_cffi":
-                    self.log(
-                        "⚠ curl_cffi نصب نیست؛ بعضی سایت‌ها ممکن است پاسخ ندهند. "
-                        "نصب: pip install curl_cffi"
-                    )
-                stats = filler.run(
+            if auto:
+                self.log(
+                    f"🔁 حالت خودکار: هر {options.auto_every_minutes} دقیقه یک‌بار شیت"
+                    " دوباره خوانده می‌شود. برای توقف، «لغو» را بزنید."
+                )
+                stats = filler.run_auto(
                     conn,
                     self.config,
                     options,
-                    fetcher,
+                    lambda: http.fetcher_from_config(self.config),
                     log=self.log,
                     should_stop=self._cancel.is_set,
                 )
+            else:
+                with http.fetcher_from_config(self.config) as fetcher:
+                    if fetcher.backend != "curl_cffi":
+                        self.log(
+                            "⚠ curl_cffi نصب نیست؛ بعضی سایت‌ها ممکن است پاسخ ندهند. "
+                            "نصب: pip install curl_cffi"
+                        )
+                    stats = filler.run(
+                        conn,
+                        self.config,
+                        options,
+                        fetcher,
+                        log=self.log,
+                        should_stop=self._cancel.is_set,
+                    )
             summary = stats.render()
             for line in summary.splitlines():
                 self.log(line)

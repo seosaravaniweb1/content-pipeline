@@ -218,7 +218,7 @@ def test_a_page_about_another_product_is_not_used(env, tmp_path):
     assert stats.no_source == 1
 
 
-def test_session_cap_leaves_the_rest_in_the_queue(env, tmp_path):
+def test_the_row_cap_leaves_the_rest_in_the_queue(env, tmp_path):
     conn, config = env
     title = "دانلود رمان تاوان خیانت"
     link(conn, title, "https://a.ir/p/1")
@@ -229,7 +229,7 @@ def test_session_cap_leaves_the_rest_in_the_queue(env, tmp_path):
         path,
         FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE}),
         search={"enabled": False},
-        max_titles_per_session=1,
+        limit=1,
     )
     assert stats.processed == 1
     assert len(db.rows_of(conn, options.key, db.PENDING)) == 2
@@ -434,6 +434,8 @@ def test_api_requires_the_session_token(panel):
 def test_panel_starts_empty_and_saves_settings(panel, tmp_path):
     status, data = panel("/api/state")
     assert status == 200 and data["ready"] is False
+    # فرم پنل از فهرست تنظیمات ساخته می‌شود، نه از کد جاوااسکریپت
+    assert {field["key"] for field in data["fields"]} >= {"sheet_url", "sites", "auto"}
 
     path = sheet_file(tmp_path, EXAM_HEADER, [["نمونه سوالات کمک حسابدار"]], "exam.csv")
     status, saved = panel(
@@ -442,15 +444,24 @@ def test_panel_starts_empty_and_saves_settings(panel, tmp_path):
         body={"file": str(path), "max_sources_per_title": 3, "overwrite": "always"},
     )
     assert status == 200 and saved["ready"] is True
-    assert saved["settings"]["max_sources_per_title"] == 3
+    assert saved["values"]["max_sources_per_title"] == 3
 
     _, again = panel("/api/state")
-    assert again["settings"]["file"] == str(path)  # در دیتابیس ماندگار است
+    assert again["values"]["file"] == str(path)  # در دیتابیس ماندگار است
 
 
 def test_a_sheet_without_a_service_account_is_refused(panel):
-    status, payload = panel("/api/settings", method="POST", body={"sheet_id": "1AbC"})
+    status, payload = panel(
+        "/api/settings",
+        method="POST",
+        body={"sheet_url": "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvW/edit"},
+    )
     assert status == 400 and "سرویس‌اکانت" in payload["error"]
+
+
+def test_a_broken_sheet_url_is_refused(panel):
+    status, payload = panel("/api/settings", method="POST", body={"sheet_url": "https://ex.com/x"})
+    assert status == 400 and "آدرس گوگل‌شیت" in payload["error"]
 
 
 def test_panel_inspects_a_sheet_without_writing(panel, tmp_path):
@@ -486,4 +497,131 @@ def test_sites_pasted_in_the_panel_are_cleaned(panel):
         body={"sites": "shop1.ir\n  https://shop2.ir  \n\n# یادداشت\nنه-یک-آدرس"},
     )
     assert status == 200
-    assert data["sites"] == ["https://shop1.ir", "https://shop2.ir"]
+    assert data["values"]["sites"] == ["https://shop1.ir", "https://shop2.ir"]
+
+
+# ---------------------------------------------------------------------------
+# اتوماتیک‌سازی
+# ---------------------------------------------------------------------------
+
+
+def test_a_whole_sheet_url_is_enough(env):
+    """کاربر کل آدرس را کپی می‌کند؛ شناسه خودکار درمی‌آید."""
+    _, config = env
+    options = filler.options_from_config(
+        config,
+        {"sheet_url": "https://docs.google.com/spreadsheets/d/1AbCdEfGh_IjKlMnOpQrS/edit#gid=7"},
+    )
+    assert options.sheet.sheet_id == "1AbCdEfGh_IjKlMnOpQrS"
+
+
+def test_auto_mode_refills_the_sheet_each_round(env, tmp_path):
+    """عنوانی که بعداً به شیت اضافه شود، در دور بعدی خودش پر می‌شود."""
+    conn, config = env
+    first_title = "دانلود رمان تاوان خیانت"
+    second_title = "نمونه سوالات فنی حرفه‌ای کمک حسابدار"
+    link(conn, first_title, "https://a.ir/p/1")
+    link(conn, second_title, "https://a.ir/p/2")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[first_title]])
+    fetcher = FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE, "https://a.ir/p/2": NOVEL_PAGE})
+    options = filler.options_from_config(
+        config,
+        {"file": str(path), "report_tab": "", "auto": True, "auto_every_minutes": 1},
+    )
+    options.search_enabled = False
+
+    rounds: list[int] = []
+
+    def between_rounds(_seconds: float) -> None:
+        """وسط خوابِ بین دورها، یک عنوان تازه به شیت اضافه می‌کنیم."""
+        if rounds:
+            return
+        rounds.append(1)
+        with path.open("a", encoding="utf-8-sig", newline="") as handle:
+            csv.writer(handle).writerow([second_title] + [""] * (len(NOVEL_HEADER) - 1))
+
+    stats = filler.run_auto(
+        conn,
+        config,
+        options,
+        lambda: fetcher,
+        log=lambda _: None,
+        sleep=between_rounds,
+        rounds=2,
+    )
+    assert stats.processed == 2  # یکی در دور اول، یکی در دور دوم
+    titles = {row["title"] for row in db.rows_of(conn, options.key)}
+    assert titles == {first_title, second_title}
+
+
+def test_auto_mode_stops_when_asked(env, tmp_path):
+    conn, config = env
+    path = sheet_file(tmp_path, NOVEL_HEADER, [["رمان الف"]])
+    options = filler.options_from_config(config, {"file": str(path), "report_tab": "", "auto": True})
+    options.search_enabled = False
+    calls = {"n": 0}
+
+    def stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2  # بعد از شروع، «توقف» زده می‌شود
+
+    stats = filler.run_auto(
+        conn, config, options, lambda: FakeFetcher({}), log=lambda _: None, should_stop=stop
+    )
+    assert "دور اجرا شد" in stats.stopped_early
+
+
+def test_sites_are_learned_from_imported_links(env):
+    """کاربر سایتی تنظیم نکرده ولی آدرس‌ها را داده — همان دامنه‌ها منبع می‌شوند."""
+    conn, config = env
+    link(conn, "رمان الف", "https://shop1.ir/p/1")
+    link(conn, "رمان ب", "https://shop2.ir/p/2")
+    options = filler.options_from_config(config, {"file": "x.csv"})
+    assert options.sites == []
+    ordered = filler._ordered_sites(conn, options)
+    assert {site.domain for site in ordered} == {"shop1.ir", "shop2.ir"}
+
+
+def test_domains_that_worked_are_tried_first(env):
+    conn, config = env
+    options = filler.options_from_config(
+        config, {"file": "x.csv", "sites": ["https://slow.ir", "https://good.ir"]}
+    )
+    with db.transaction(conn):
+        for _ in range(3):
+            db.note_domain(conn, "good.ir")
+    assert [site.domain for site in filler._ordered_sites(conn, options)][0] == "good.ir"
+
+
+def test_a_row_without_sources_is_retried_after_a_while(env, tmp_path):
+    """ردیف بی‌منبع بعد از چند روز خودش دوباره امتحان می‌شود."""
+    conn, config = env
+    path = sheet_file(tmp_path, NOVEL_HEADER, [["رمان بدون منبع"]])
+    options = filler.options_from_config(config, {"file": str(path)})
+    title_key = normalizer.normalize("رمان بدون منبع")
+    with db.transaction(conn):
+        row_id = db.upsert_row(conn, options.key, "رمان بدون منبع", title_key, 2)
+        db.save_values(conn, row_id, {}, status=db.PARTIAL, note="هیچ صفحه‌ی منبعی پیدا نشد")
+
+    assert filler._needs_work(conn, options.key, title_key, options) is False
+    # همان ردیف، ولی ثبت‌شده در گذشته
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE rows SET updated_at=? WHERE id=?", ("2000-01-01T00:00:00+00:00", row_id)
+        )
+    assert filler._needs_work(conn, options.key, title_key, options) is True
+
+
+def test_settings_have_one_definition(env):
+    """هر تنظیمِ پنل باید در FillOptions هم شناخته شود (تعریف تکراری نداریم)."""
+    from sheet_filler.core import settings as settings_module
+
+    unknown = {
+        field.key
+        for field in settings_module.FIELDS
+        if field.key not in filler.FillOptions.__dataclass_fields__
+        and field.key not in {"sheet_url", "service_account_json", "tab", "file",
+                              "title_column", "sources_column", "lists_tab",
+                              "report_tab", "header_row", "image"}
+    }
+    assert not unknown, f"تنظیم‌های بی‌صاحب: {unknown}"

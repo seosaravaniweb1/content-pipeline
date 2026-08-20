@@ -60,26 +60,15 @@ class SourceSite:
 
 DEFAULT_SEARCH_URL = "{base}/?s={query}"
 
+#: پیش‌فرض‌های ساختاری. مقدارهای رفتاری (سقف‌ها، آستانه‌ها، تصویر، خلاصه) اینجا
+#: **نیستند**: یک جا تعریف می‌شوند — در :class:`core.filler.FillOptions` — و
+#: هر کلیدی که در ``config.yaml`` بنویسید روی همان سوار می‌شود. این‌طوری یک
+#: تنظیم دو تعریف ندارد که از هم جدا بیفتند.
 DEFAULTS: dict[str, Any] = {
     "database": {"path": "sheet_filler/data/filler.db"},
-    # --- شیت --------------------------------------------------------------
-    "sheet": {
-        "sheet_id": "",
-        "service_account_json": "",
-        "tab": "",
-        "lists_tab": "لیست‌ها",
-        "report_tab": "گزارش تکمیل",
-        "header_row": 1,
-        "file": "",
-        "title_column": "",
-        "sources_column": "",
-        "columns": {},
-        "never_write": ["title", "status", "product_id", "وضعیت", "شناسه محصول"],
-        "batch_ranges": 400,
-        "value_input_option": "RAW",
-    },
-    # --- منابع ------------------------------------------------------------
+    "sheet": {},
     "sites": [],
+    "search": {"enabled": True, "url_template": DEFAULT_SEARCH_URL},
     "crawl": {
         "delay_seconds": 1.0,
         "timeout": 20,
@@ -87,48 +76,9 @@ DEFAULTS: dict[str, Any] = {
         "respect_robots": True,
         "playwright_fallback": True,
     },
-    "search": {
-        "enabled": True,
-        "url_template": DEFAULT_SEARCH_URL,
-        "max_results_per_site": 8,
-    },
-    # --- قواعد پر کردن ------------------------------------------------------
-    "fill": {
-        "overwrite": "empty",
-        "retry_partial": False,
-        "limit": 0,
-        "max_titles_per_session": 0,
-        "max_pages_per_session": 0,
-        "max_sources_per_title": 5,
-        "min_title_similarity": 0.72,
-        "batch_rows": 100,
-        "cache_ttl_days": 30,
-        "multi_select_separator": "، ",
-        "max_categories": 3,
-        "max_tags": 5,
-        "combine_author_scripts": True,
-        "labels": {
-            "iranian": "ایرانی",
-            "foreign": "خارجی",
-            "pdf": "پی دی اف",
-            "audio": "صوتی",
-        },
-        "summary": {"min_chars": 200, "max_chars": 1200, "max_sentences": 14},
-        "numbers": {"min_agreement": 2, "accept_single": True},
-        "taxonomy": {},
-    },
-    "image": {
-        "enabled": True,
-        "min_side": 400,
-        "square_tolerance": 0.04,
-        "max_downloads": 6,
-        "require_square": True,
-        "allow_unknown_size": False,
-        "reject_url_patterns": [],
-        "prefer_domains": [],
-        "block_domains": [],
-    },
-    "output": {"xlsx_path": "sheet_filler/data/filled-{stamp}.xlsx"},
+    "fill": {},
+    "image": {},
+    "normalizer": {},
 }
 
 

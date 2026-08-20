@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMP
 );
 
+-- دامنه‌هایی که تا حالا جواب داده‌اند: دفعه‌ی بعد اول سراغ همان‌ها می‌رویم
+CREATE TABLE IF NOT EXISTS domains (
+    domain   TEXT PRIMARY KEY,
+    hits     INTEGER DEFAULT 0,
+    last_at  TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_rows_sheet  ON rows(sheet_key, status);
 CREATE INDEX IF NOT EXISTS idx_links_title ON source_links(title_key);
 """
@@ -345,6 +352,15 @@ def clear_pages(conn: sqlite3.Connection) -> int:
 
 
 def add_source_link(conn: sqlite3.Connection, title_key: str, url: str, domain: str = "") -> None:
+    """ثبت «این عنوان، این آدرس».
+
+    دامنه اگر داده نشود از خود آدرس درمی‌آید؛ صداکننده نباید یادش برود، چون
+    همین دامنه‌ها بعداً به‌عنوان سایت منبع استفاده می‌شوند.
+    """
+    if not domain:
+        from urllib.parse import urlsplit
+
+        domain = urlsplit(url).netloc.lower()
     conn.execute(
         """INSERT OR IGNORE INTO source_links (title_key, url, domain, added_at)
            VALUES (?,?,?,?)""",
@@ -362,6 +378,58 @@ def source_links(conn: sqlite3.Connection, title_key: str, limit: int = 20) -> l
 
 def link_count(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) c FROM source_links").fetchone()["c"])
+
+
+# ---------------------------------------------------------------------------
+# دامنه‌های موفق (خودکار یاد گرفته می‌شوند)
+# ---------------------------------------------------------------------------
+
+
+def note_domain(conn: sqlite3.Connection, domain: str) -> None:
+    """این دامنه یک بار دیگر جواب داد."""
+    if not domain:
+        return
+    conn.execute(
+        """INSERT INTO domains (domain, hits, last_at) VALUES (?,1,?)
+           ON CONFLICT(domain) DO UPDATE SET hits=hits+1, last_at=excluded.last_at""",
+        (domain, utcnow()),
+    )
+
+
+def domain_scores(conn: sqlite3.Connection) -> dict[str, int]:
+    """``دامنه → تعداد دفعاتی که برای یک عنوان به درد خورده``."""
+    return {
+        row["domain"]: int(row["hits"] or 0)
+        for row in conn.execute("SELECT domain, hits FROM domains").fetchall()
+    }
+
+
+def known_domains(conn: sqlite3.Connection, limit: int = 20) -> list[str]:
+    """دامنه‌هایی که از لینک‌های ذخیره‌شده می‌شناسیم.
+
+    وقتی کاربر سایتی تنظیم نکرده ولی نگاشت «عنوان → آدرس» ایمپورت کرده،
+    همین‌ها سایت‌های منبع‌اند و لازم نیست دوباره بپرسیم.
+    """
+    rows = conn.execute(
+        """SELECT domain, COUNT(*) c FROM source_links
+           WHERE domain IS NOT NULL AND domain <> '' GROUP BY domain
+           ORDER BY c DESC LIMIT ?""",
+        (int(limit),),
+    ).fetchall()
+    return [row["domain"] for row in rows]
+
+
+def older_than(timestamp: str | None, days: int) -> bool:
+    """آیا این زمان از ``days`` روز پیش قدیمی‌تر است؟"""
+    if not timestamp or days <= 0:
+        return False
+    try:
+        moment = datetime.fromisoformat(str(timestamp))
+    except (TypeError, ValueError):
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - moment > timedelta(days=days)
 
 
 # ---------------------------------------------------------------------------

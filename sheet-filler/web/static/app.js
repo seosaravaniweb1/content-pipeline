@@ -48,7 +48,7 @@ async function api(path, { method = "GET", body = null, params = {} } = {}) {
   return data;
 }
 
-const state = { logNext: 0, jobStatus: "idle", plan: [], kinds: {} };
+const state = { logNext: 0, jobStatus: "idle", fields: [], kinds: {} };
 
 /* -------------------------------------------------------------------- تب */
 for (const button of document.querySelectorAll("#tabs button")) {
@@ -58,56 +58,62 @@ for (const button of document.querySelectorAll("#tabs button")) {
     button.classList.add("active");
     $(`#tab-${button.dataset.tab}`).classList.add("active");
     if (button.dataset.tab === "rows") loadRows();
-    if (button.dataset.tab === "config") loadConfig();
   });
 }
 
-/* -------------------------------------------------------------- تنظیمات */
-const FIELDS = [
-  ["sheetId", "sheet_id"],
-  ["serviceAccount", "service_account_json"],
-  ["tab", "tab"],
-  ["listsTab", "lists_tab"],
-  ["reportTab", "report_tab"],
-  ["headerRow", "header_row"],
-  ["titleColumn", "title_column"],
-  ["sourcesColumn", "sources_column"],
-  ["file", "file"],
-  ["overwrite", "overwrite"],
-  ["limit", "limit"],
-  ["maxTitles", "max_titles_per_session"],
-  ["maxPages", "max_pages_per_session"],
-  ["maxSources", "max_sources_per_title"],
-  ["batchRows", "batch_rows"],
-  ["maxCats", "max_categories"],
-  ["maxTags", "max_tags"],
-  ["separator", "multi_select_separator"],
-];
+/* ------------------------------------------------------------ فرم تنظیمات */
+// فرم از فهرستی که سرور می‌دهد ساخته می‌شود (core/settings.py). افزودن یک
+// تنظیم تازه یعنی یک خط پایتون، نه دست زدن به این فایل.
+function renderFields(fields, values) {
+  state.fields = fields;
+  const build = (field) => {
+    const id = `f_${field.key}`;
+    let control;
+    if (field.kind === "bool") {
+      control = el("input", { type: "checkbox", id, checked: Boolean(values[field.key]) });
+    } else if (field.kind === "number") {
+      control = el("input", { type: "number", id, min: 0, value: values[field.key] ?? 0 });
+    } else if (field.kind === "choice") {
+      control = el("select", { id }, field.choices.map((choice) =>
+        el("option", { value: choice.value, textContent: choice.label,
+                       selected: values[field.key] === choice.value })));
+    } else if (field.kind === "lines") {
+      control = el("textarea", {
+        id, dir: "ltr", spellcheck: false,
+        value: (values[field.key] || []).join("\n"),
+        placeholder: "https://shop1.ir\nhttps://shop2.ir",
+      });
+    } else {
+      control = el("input", { type: "text", id, value: values[field.key] ?? "" });
+    }
+    return el("tr", {}, [
+      el("td", {}, [el("label", { htmlFor: id, textContent: field.label })]),
+      el("td", {}, field.hint
+        ? [control, el("div", { className: "muted hint", textContent: field.hint })]
+        : [control]),
+    ]);
+  };
 
-function settingsBody() {
+  $("#basicFields").replaceChildren(...fields.filter((f) => !f.advanced).map(build));
+  $("#advancedFields").replaceChildren(...fields.filter((f) => f.advanced).map(build));
+}
+
+function formValues() {
   const body = {};
-  for (const [id, key] of FIELDS) body[key] = $(`#${id}`).value.trim();
-  body.retry_partial = $("#retryPartial").checked;
-  body.search_enabled = $("#searchEnabled").checked;
-  body.image_enabled = $("#imageEnabled").checked;
-  body.image_min_side = Number($("#imageMinSide").value) || 0;
+  for (const field of state.fields) {
+    const node = $(`#f_${field.key}`);
+    if (!node) continue;
+    body[field.key] = field.kind === "bool" ? node.checked : node.value;
+  }
   return body;
 }
 
+/* ------------------------------------------------------------------ حالت */
 function applyState(data) {
-  const s = data.settings || {};
-  for (const [id, key] of FIELDS) $(`#${id}`).value = s[key] ?? "";
-  $("#retryPartial").checked = Boolean(s.retry_partial);
-  $("#searchEnabled").checked = s.search_enabled !== false;
-  $("#imageEnabled").checked = s.image_enabled !== false;
-  $("#imageMinSide").value = s.image_min_side ?? 400;
-  if (document.activeElement !== $("#sitesText")) {
-    $("#sitesText").value = (data.sites || []).join("\n");
-  }
-
+  if (data.fields) renderFields(data.fields, data.values || {});
   state.kinds = data.kinds || {};
-  state.plan = data.plan || [];
-  renderPlan(state.plan.map((item) => ({
+
+  renderPlan((data.plan || []).map((item) => ({
     ...item,
     kind_label: state.kinds[item.kind] || item.kind,
     labels: item.labels || [],
@@ -123,20 +129,23 @@ function applyState(data) {
     el("b", { textContent: value ?? "—" }), el("span", { textContent: label }),
   ])));
 
-  $("#sheetLabel").textContent = s.sheet_id
-    ? `شیت ${s.sheet_id.slice(0, 8)}…${s.tab ? ` / ${s.tab}` : ""}`
-    : (s.file || "هنوز شیتی تنظیم نشده");
-  const notes = [];
-  if (!data.ready) notes.push("شیت تنظیم نشده");
-  if (s.sheet_id && !data.gspread) notes.push("gspread نصب نیست: pip install gspread");
-  $("#headStatus").textContent = notes.join(" — ");
+  const values = data.values || {};
+  $("#sheetLabel").textContent = values.sheet_url
+    ? (values.tab ? `شیت / ${values.tab}` : "گوگل‌شیت")
+    : (values.file || "هنوز شیتی تنظیم نشده");
+  $("#autoNote").textContent = values.auto
+    ? `حالت خودکار روشن است: هر ${values.auto_every_minutes} دقیقه یک‌بار شیت دوباره خوانده می‌شود.`
+    : "حالت خودکار خاموش است — هر بار خودتان «اجرا» را می‌زنید.";
   $("#linksNote").textContent = data.links ? `${data.links} آدرس ذخیره شده` : "";
-  $("#configPath").textContent = data.config_path || "(بدون فایل config)";
+
+  if (!data.ready) $("#headStatus").textContent = "شیت تنظیم نشده";
+  else if (values.sheet_url && !data.gspread) {
+    $("#headStatus").textContent = "gspread نصب نیست: pip install gspread";
+  }
 
   const link = (format) => `/download?format=${format}&t=${encodeURIComponent(token)}`;
   $("#dlCsv").href = link("csv");
   $("#dlXlsx").href = link("xlsx");
-
   applyJob(data.job);
 }
 
@@ -157,48 +166,34 @@ async function refresh() {
   catch (error) { toast(error.message, true); }
 }
 
-async function save(extra = {}) {
-  const data = await api("/api/settings", { method: "POST", body: { ...settingsBody(), ...extra } });
+async function save() {
+  const data = await api("/api/settings", { method: "POST", body: formValues() });
   applyState(data);
   return data;
 }
 
-$("#saveSheetBtn").addEventListener("click", async () => {
-  try { await save(); toast("تنظیمات شیت ذخیره شد."); }
+$("#saveBtn").addEventListener("click", async () => {
+  try { await save(); toast("ذخیره شد."); }
   catch (error) { toast(error.message, true); }
 });
 
-$("#saveRulesBtn").addEventListener("click", async () => {
-  try { await save(); toast("قواعد ذخیره شد."); }
-  catch (error) { toast(error.message, true); }
-});
-
-$("#saveSitesBtn").addEventListener("click", async () => {
-  try {
-    const data = await save({ sites: $("#sitesText").value });
-    toast(`${(data.sites || []).length} سایت ذخیره شد.`);
-  } catch (error) { toast(error.message, true); }
-});
-
-/* --------------------------------------------------------- بررسی شیت */
 $("#inspectBtn").addEventListener("click", async () => {
   $("#inspectNote").textContent = "در حال خواندن شیت…";
   try {
     await save();
-    const data = await api("/api/inspect", { method: "POST", body: settingsBody() });
+    const data = await api("/api/inspect", { method: "POST", body: formValues() });
     const lists = Object.entries(data.lists || {})
       .map(([name, count]) => `${name} (${count})`).join("، ");
     $("#inspectNote").textContent =
       `${data.rows} ردیف — ${data.plan.length} ستون` + (lists ? ` — لیست‌ها: ${lists}` : "");
     renderPlan(data.plan);
-    if (data.sample?.length) toast(`نمونه‌ی عنوان: ${data.sample[0]}`);
   } catch (error) {
     $("#inspectNote").textContent = "";
     toast(error.message, true);
   }
 });
 
-/* ------------------------------------------------------------- منابع */
+/* ------------------------------------------------------------------ منابع */
 $("#importLinksBtn").addEventListener("click", async () => {
   const file = $("#linksFile").value.trim();
   if (!file) return toast("مسیر فایل را بدهید.", true);
@@ -213,7 +208,7 @@ $("#clearCacheBtn").addEventListener("click", async () => {
   if (!confirm("کش صفحه‌های منبع خالی شود؟ اجرای بعدی دوباره دانلود می‌کند.")) return;
   try {
     const data = await api("/api/cache/clear", { method: "POST", body: {} });
-    $("#cacheNote").textContent = `${data.cleared} صفحه پاک شد.`;
+    toast(`${data.cleared} صفحه از کش پاک شد.`);
   } catch (error) { toast(error.message, true); }
 });
 
@@ -222,13 +217,13 @@ function applyJob(job) {
   if (!job) return;
   state.jobStatus = job.status;
   const labels = {
-    idle: "بی‌کار", running: "در حال اجرا", done: "تمام شد",
-    failed: "شکست خورد", cancelled: "لغو شد",
+    idle: "بی‌کار", running: job.auto ? "در حال اجرا (خودکار)" : "در حال اجرا",
+    done: "تمام شد", failed: "شکست خورد", cancelled: "متوقف شد",
   };
   const elapsed = job.elapsed ? ` — ${job.elapsed} ثانیه` : "";
-  const text = (labels[job.status] || job.status) + elapsed + (job.error ? ` — ${job.error}` : "");
-  $("#headStatus").textContent = text;
-  for (const id of ["#runBtn", "#runBtn2"]) $(id).disabled = job.status === "running";
+  $("#headStatus").textContent =
+    (labels[job.status] || job.status) + elapsed + (job.error ? ` — ${job.error}` : "");
+  for (const id of ["#runBtn", "#runBtn2", "#tryBtn"]) $(id).disabled = job.status === "running";
   for (const id of ["#cancelBtn", "#cancelBtn2"]) $(id).disabled = job.status !== "running";
 
   if (job.next !== undefined && job.next < state.logNext) {
@@ -246,23 +241,24 @@ function applyJob(job) {
   }
 }
 
-async function startRun() {
+async function startRun(extra = {}) {
   try {
     await save();
     $("#log").textContent = "";
     state.logNext = 0;
-    applyJob(await api("/api/start", { method: "POST", body: {} }));
+    applyJob(await api("/api/start", { method: "POST", body: extra }));
     toast("اجرا شروع شد.");
     document.querySelector('#tabs button[data-tab="run"]').click();
   } catch (error) { toast(error.message, true); }
 }
 
-for (const id of ["#runBtn", "#runBtn2"]) $(id).addEventListener("click", startRun);
+for (const id of ["#runBtn", "#runBtn2"]) $(id).addEventListener("click", () => startRun());
+$("#tryBtn").addEventListener("click", () => startRun({ once: true, limit: 20 }));
 for (const id of ["#cancelBtn", "#cancelBtn2"]) {
   $(id).addEventListener("click", async () => {
     try {
       await api("/api/cancel", { method: "POST", body: {} });
-      toast("لغو ثبت شد؛ بعد از ردیف جاری متوقف می‌شود.");
+      toast("توقف ثبت شد؛ بعد از ردیف جاری متوقف می‌شود.");
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -316,40 +312,6 @@ async function loadRows() {
 
 $("#refreshRowsBtn").addEventListener("click", loadRows);
 $("#rowFilter").addEventListener("change", loadRows);
-
-/* --------------------------------------------------------- config.yaml */
-async function loadConfig() {
-  try {
-    const data = await api("/api/config");
-    $("#configText").value = data.text;
-    $("#configText").disabled = !data.editable;
-    $("#configSave").disabled = !data.editable;
-  } catch (error) { toast(error.message, true); }
-}
-
-$("#configReload").addEventListener("click", loadConfig);
-$("#configSave").addEventListener("click", async () => {
-  try {
-    const result = await api("/api/config", { method: "POST", body: { text: $("#configText").value } });
-    toast(`ذخیره شد. پشتیبان: ${result.backup}`);
-    await refresh();
-  } catch (error) { toast(error.message, true); }
-});
-
-/* ------------------------------------------------------ کلمه‌ی کلیدی */
-async function runKeyword() {
-  try {
-    const data = await api("/api/keyword", { params: { text: $("#keywordInput").value } });
-    $("#keywordOut").replaceChildren(...[
-      ["کلمه کلیدی", data.keyword],
-      ["کلید تطبیق", data.match_key],
-    ].map(([k, v]) => el("tr", {}, [el("td", { textContent: k }), el("td", { textContent: v })])));
-  } catch (error) { toast(error.message, true); }
-}
-$("#keywordBtn").addEventListener("click", runKeyword);
-$("#keywordInput").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") runKeyword();
-});
 
 /* --------------------------------------------------------------- پولینگ */
 async function poll() {

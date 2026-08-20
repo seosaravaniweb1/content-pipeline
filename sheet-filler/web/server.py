@@ -5,13 +5,13 @@
 می‌کند و هر درخواست API به توکن نشست نیاز دارد؛ توکن در همان لینکی است که
 ترمینال چاپ می‌کند.
 
-پنجِ کاری که از پنل انجام می‌شود:
+سه تب، سه کار:
 
-1. اتصال به شیت (شناسه، سرویس‌اکانت، تب) و **بررسی ستون‌ها بدون نوشتن**
-2. معرفی سایت‌های منبع و ایمپورت نگاشت «عنوان → آدرس»
-3. تنظیم قواعد پر کردن و اجرا، با لاگ زنده و دکمه‌ی لغو
-4. دیدن ردیف‌ها و وضعیتشان
-5. ویرایش ``config.yaml``
+1. **شروع** — آدرس شیت، سایت‌های منبع، و «بررسی شیت» که بدون نوشتن می‌گوید هر
+   ستون چطور پر می‌شود. فرم از :mod:`core.settings` ساخته می‌شود، پس افزودن یک
+   تنظیم یعنی یک خط پایتون نه دست زدن به این فایل.
+2. **اجرا و لاگ** — دکمه‌ی اجرا/توقف، شمارنده‌ها، لاگ زنده، دانلود خروجی.
+3. **ردیف‌ها** — وضعیت هر ردیف با ستون‌های همان شیت.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import secrets
-import shutil
 import sqlite3
 import threading
 from http import HTTPStatus
@@ -28,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urlparse
 
-from ..core import db, filler, gsheet, normalizer, sources, taxonomy
+from ..core import db, filler, gsheet, normalizer, settings, sources
 from ..core.config import Config, ConfigError, load_config
 from . import jobs
 
@@ -82,8 +81,13 @@ class PanelState:
         return stored if isinstance(stored, dict) else {}
 
     def options(self, extra: dict | None = None) -> filler.FillOptions:
-        merged = {**self.settings(), **{k: v for k, v in (extra or {}).items() if v is not None}}
-        return filler.options_from_config(self.config, merged)
+        """تنظیمات ذخیره‌شده + آنچه همین حالا در فرم پنل است."""
+        incoming = {
+            key: value
+            for key, value in (extra or {}).items()
+            if key in settings.BY_KEY and value is not None
+        }
+        return filler.options_from_config(self.config, {**self.settings(), **incoming})
 
 
 def _guard_idle(state: PanelState) -> None:
@@ -98,85 +102,32 @@ def _guard_idle(state: PanelState) -> None:
 # API
 # ---------------------------------------------------------------------------
 
-#: کلیدهای متنی که از فرم پنل پذیرفته می‌شوند
-TEXT_KEYS = (
-    "sheet_id",
-    "service_account_json",
-    "tab",
-    "lists_tab",
-    "report_tab",
-    "file",
-    "title_column",
-    "sources_column",
-    "overwrite",
-    "multi_select_separator",
-)
-INT_KEYS = (
-    "header_row",
-    "limit",
-    "max_titles_per_session",
-    "max_pages_per_session",
-    "max_sources_per_title",
-    "batch_rows",
-    "max_categories",
-    "max_tags",
-)
-BOOL_KEYS = ("retry_partial",)
-
-
 def api_state(state: PanelState, query: dict) -> dict:
     conn = state.conn()
     options = state.options()
     key = options.key
-    sheets = [
-        {
-            "key": row["sheet_key"],
-            "title": row["title"] or row["sheet_key"],
-            "updated_at": row["updated_at"],
-            "current": row["sheet_key"] == key,
-        }
-        for row in db.list_sheets(conn)
-    ]
     return {
-        "settings": _settings_dict(options),
-        "sites": [site.base_url for site in options.sites],
-        "ready": bool(options.sheet.sheet_id or options.sheet.file),
+        # فرم پنل از همین فهرست ساخته می‌شود: افزودن یک تنظیم = یک خط در
+        # core/settings.py، نه دست زدن به سرور و جاوااسکریپت.
+        "fields": settings.describe(),
+        "values": {**settings.defaults(), **state.settings()},
+        "ready": options.ready,
         "gspread": _gspread_available(),
         "counts": db.counts_of(conn, key),
         "links": db.link_count(conn),
         "plan": db.sheet_plan(conn, key),
         "kinds": filler.KIND_LABELS,
-        "sheets": sheets,
+        "sheets": [
+            {
+                "key": row["sheet_key"],
+                "title": row["title"] or row["sheet_key"],
+                "updated_at": row["updated_at"],
+                "current": row["sheet_key"] == key,
+            }
+            for row in db.list_sheets(conn)
+        ],
         "config_path": str(state.config_path) if state.config_path else "",
-        "db_path": state.config.db_path,
         "job": state.runner.snapshot(int(query.get("since") or 0)),
-    }
-
-
-def _settings_dict(options: filler.FillOptions) -> dict:
-    return {
-        "sheet_id": options.sheet.sheet_id,
-        "service_account_json": options.sheet.service_account_json,
-        "tab": options.sheet.tab,
-        "lists_tab": options.sheet.lists_tab,
-        "report_tab": options.sheet.report_tab,
-        "header_row": options.sheet.header_row,
-        "file": options.sheet.file,
-        "title_column": options.sheet.title_column,
-        "sources_column": options.sheet.sources_column,
-        "overwrite": options.overwrite,
-        "retry_partial": options.retry_partial,
-        "limit": options.limit,
-        "max_titles_per_session": options.max_titles_per_session,
-        "max_pages_per_session": options.max_pages_per_session,
-        "max_sources_per_title": options.max_sources_per_title,
-        "batch_rows": options.batch_rows,
-        "max_categories": options.max_categories,
-        "max_tags": options.max_tags,
-        "multi_select_separator": options.separator,
-        "search_enabled": options.search_enabled,
-        "image_enabled": options.image.enabled,
-        "image_min_side": options.image.min_side,
     }
 
 
@@ -187,86 +138,41 @@ def _gspread_available() -> bool:
 
 
 def api_save_settings(state: PanelState, body: dict) -> dict:
-    """ذخیره‌ی تنظیمات پنل در دیتابیس.
+    """ذخیره‌ی تنظیمات پنل.
 
     عمداً در ``config.yaml`` نوشته نمی‌شود: بازنویسی YAML توضیحات و ترتیب
     فایل شما را از بین می‌برد. این مقدارها روی config سوار می‌شوند و CLI هم
     از همان‌ها استفاده می‌کند.
     """
     _guard_idle(state)
-    settings = state.settings()
-    for key in TEXT_KEYS:
-        if key in body:
-            settings[key] = str(body.get(key) or "").strip()
-    for key in INT_KEYS:
-        if key in body:
-            try:
-                settings[key] = max(0, int(body.get(key) or 0))
-            except (TypeError, ValueError):
-                raise ApiError(f"مقدار «{key}» باید عدد باشد.") from None
-    for key in BOOL_KEYS:
-        if key in body:
-            settings[key] = bool(body.get(key))
-    if "search_enabled" in body:
-        settings["search"] = {**(settings.get("search") or {}), "enabled": bool(body["search_enabled"])}
-    if "image_enabled" in body or "image_min_side" in body:
-        image = dict(settings.get("image") or {})
-        if "image_enabled" in body:
-            image["enabled"] = bool(body.get("image_enabled"))
-        if "image_min_side" in body:
-            try:
-                image["min_side"] = max(0, int(body.get("image_min_side") or 0))
-            except (TypeError, ValueError):
-                raise ApiError("حداقل اندازه‌ی تصویر باید عدد باشد.") from None
-        settings["image"] = image
-    if "sites" in body:
-        settings["sites"] = clean_sites(body.get("sites"))
+    stored = state.settings()
+    incoming = {key: value for key, value in body.items() if key in settings.BY_KEY}
+    try:
+        stored.update(settings.normalize(incoming))
+    except ValueError as exc:
+        raise ApiError(str(exc)) from None
 
-    if settings.get("overwrite") not in ("empty", "always"):
-        settings["overwrite"] = "empty"
-    if settings.get("sheet_id") and not settings.get("service_account_json"):
-        raise ApiError(
-            "برای گوگل‌شیت، مسیر فایل json سرویس‌اکانت هم لازم است."
-            " (یا به‌جای شیت، یک فایل csv/xlsx بدهید.)"
-        )
-    db.set_setting(state.conn(), "settings", settings)
+    if stored.get("sheet_url"):
+        if not settings.sheet_id_from(stored["sheet_url"]):
+            raise ApiError("آدرس گوگل‌شیت درست نیست؛ کل آدرس را از نوار مرورگر کپی کنید.")
+        if not settings.find_service_account(
+            stored.get("service_account_json", ""), state.config_path
+        ):
+            raise ApiError(
+                "فایل json سرویس‌اکانت پیدا نشد. مسیرش را بدهید یا کنار config.yaml بگذارید."
+                " (یا به‌جای شیت، یک فایل csv/xlsx بدهید.)"
+            )
+    db.set_setting(state.conn(), "settings", stored)
     state.runner.config = state.config
     return api_state(state, {})
-
-
-MAX_SITES = 100
-
-
-def clean_sites(raw: object) -> list[str]:
-    """متن چسبانده‌شده‌ی کاربر → فهرست آدرس یکتا."""
-    if isinstance(raw, str):
-        lines = raw.splitlines()
-    elif isinstance(raw, list):
-        lines = [str(item) for item in raw]
-    else:
-        return []
-    out: list[str] = []
-    for line in lines:
-        url = line.strip().strip(",،")
-        if not url or url.startswith("#"):
-            continue
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        if "." not in url.split("//", 1)[-1]:
-            continue
-        if url not in out:
-            out.append(url)
-        if len(out) >= MAX_SITES:
-            break
-    return out
 
 
 def api_inspect(state: PanelState, body: dict) -> dict:
     """شیت را می‌خواند و ستون‌ها را گزارش می‌دهد — بدون نوشتن هیچ چیزی."""
     _guard_idle(state)
-    options = state.options({k: v for k, v in body.items() if k in TEXT_KEYS})
-    if not (options.sheet.sheet_id or options.sheet.file):
-        raise ApiError("اول شناسه‌ی شیت یا مسیر فایل را بدهید.")
+    options = state.options(body)
+    if not options.ready:
+        raise ApiError("اول آدرس شیت یا مسیر فایل را بدهید.")
     try:
         plan, rows, lists = filler.inspect(options)
     except gsheet.SheetError as exc:
@@ -319,11 +225,12 @@ def api_rows(state: PanelState, query: dict) -> dict:
 
 
 def api_start(state: PanelState, body: dict) -> dict:
-    options = state.options({k: v for k, v in body.items() if k in TEXT_KEYS})
-    if not (options.sheet.sheet_id or options.sheet.file):
+    """شروع اجرا. ``once`` یعنی فقط یک دور، حتی اگر حالت خودکار روشن باشد."""
+    options = state.options(body)
+    if not options.ready:
         raise ApiError("اول شیت را تنظیم کنید.")
     try:
-        state.runner.start(options, state.config)
+        state.runner.start(options, state.config, auto=options.auto and not body.get("once"))
     except jobs.JobBusy as exc:
         raise ApiError(str(exc), HTTPStatus.CONFLICT) from None
     return state.runner.snapshot()
@@ -341,16 +248,6 @@ def api_reset(state: PanelState, body: dict) -> dict:
     """همه‌ی ردیف‌های این شیت دوباره در صف."""
     _guard_idle(state)
     return {"reset": db.reset_rows(state.conn(), state.options().key)}
-
-
-def api_forget_sheet(state: PanelState, body: dict) -> dict:
-    """حذف کامل سابقه‌ی یک شیت (خودِ گوگل‌شیت دست نمی‌خورد)."""
-    _guard_idle(state)
-    key = str(body.get("key") or "")
-    if not key:
-        raise ApiError("کلید شیت لازم است.")
-    db.forget_sheet(state.conn(), key)
-    return {"forgotten": key}
 
 
 def api_clear_cache(state: PanelState, body: dict) -> dict:
@@ -373,56 +270,10 @@ def api_import_links(state: PanelState, body: dict) -> dict:
     return {"titles": titles, "links": links, "total": db.link_count(state.conn())}
 
 
-def api_get_config(state: PanelState, query: dict) -> dict:
-    path = state.config_path
-    text = ""
-    if path is not None and path.exists():
-        text = path.read_text(encoding="utf-8-sig")
-    return {"path": str(path) if path else "", "text": text, "editable": path is not None}
-
-
-def api_save_config(state: PanelState, body: dict) -> dict:
-    path = state.config_path
-    if path is None:
-        raise ApiError("پنل بدون فایل config اجرا شده؛ چیزی برای ذخیره نیست.")
-    text = (body.get("text") or "").lstrip("﻿")
-    try:
-        import yaml  # noqa: PLC0415 — اختیاری است
-    except ImportError:  # pragma: no cover
-        raise ApiError("PyYAML نصب نیست: pip install pyyaml") from None
-    try:
-        parsed = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise ApiError(f"YAML نامعتبر است: {exc}") from None
-    if parsed is not None and not isinstance(parsed, dict):
-        raise ApiError("ریشه‌ی config باید یک نگاشت (کلید: مقدار) باشد.")
-    if path.exists():
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-    path.write_text(text, encoding="utf-8")
-    try:
-        state.reload_config()
-    except ConfigError as exc:
-        raise ApiError(str(exc)) from None
-    return {"saved": str(path), "backup": str(path.with_suffix(path.suffix + ".bak"))}
-
-
-def api_keyword(state: PanelState, query: dict) -> dict:
-    """ابزار کمکی: کلمه‌ی کلیدی یک عنوان چه می‌شود."""
-    text = query.get("text") or ""
-    norm_config = normalizer.config_from_mapping(state.config.get("normalizer", {}))
-    return {
-        "title": text,
-        "keyword": normalizer.main_keyword(text, norm_config),
-        "match_key": normalizer.normalize(text, norm_config),
-    }
-
-
 GET_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/state": api_state,
     "/api/job": api_job,
     "/api/rows": api_rows,
-    "/api/config": api_get_config,
-    "/api/keyword": api_keyword,
 }
 
 POST_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
@@ -431,10 +282,8 @@ POST_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/start": api_start,
     "/api/cancel": api_cancel,
     "/api/reset": api_reset,
-    "/api/sheets/forget": api_forget_sheet,
     "/api/cache/clear": api_clear_cache,
     "/api/links": api_import_links,
-    "/api/config": api_save_config,
 }
 
 
@@ -466,8 +315,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
-        self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                   "application/json; charset=utf-8")
+        self._send(
+            status,
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     def _error(self, message: str, status: int = HTTPStatus.BAD_REQUEST) -> None:
         self._json({"error": message}, status)
@@ -560,14 +412,14 @@ class PanelHandler(BaseHTTPRequestHandler):
             values.setdefault("title", record["title"] or "")
             rows.append([values.get(str(item.get("key")), "") for item in plan])
 
-        fmt = (query.get("format") or "csv").lower()
-        name = f"filled-{key.replace(':', '-')}"
-        if fmt == "xlsx":
+        if (query.get("format") or "csv").lower() == "xlsx":
             payload = _xlsx_bytes(header, rows)
             if payload is None:
                 self._error("openpyxl نصب نیست: pip install openpyxl")
                 return
-            body, mime, suffix = payload, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+            body = payload
+            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            suffix = "xlsx"
         else:
             import csv
             import io
@@ -576,13 +428,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             writer = csv.writer(buffer)
             writer.writerow(header)
             writer.writerows(rows)
-            body, mime, suffix = buffer.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8", "csv"
+            body = buffer.getvalue().encode("utf-8-sig")
+            mime, suffix = "text/csv; charset=utf-8", "csv"
 
+        name = f"filled-{key.replace(':', '-')}"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
         self.send_header(
-            "Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}.{suffix}"
+            "Content-Disposition", f"attachment; filename*=UTF-8\'\'{quote(name)}.{suffix}"
         )
         self.end_headers()
         self.wfile.write(body)

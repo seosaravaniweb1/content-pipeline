@@ -2,10 +2,10 @@
 
 نمونه‌ها::
 
-    python -m sheet_filler.run panel   -c config.yaml     # پنل مدیریت در مرورگر
-    python -m sheet_filler.run inspect -c config.yaml     # شیت چه ستون‌هایی دارد؟
-    python -m sheet_filler.run fill    -c config.yaml     # پر کردن شیت
-    python -m sheet_filler.run fill    -c config.yaml --limit 20
+    python -m sheet_filler.run panel   -c config.yaml          # پنل مدیریت در مرورگر
+    python -m sheet_filler.run inspect -c config.yaml          # شیت چه ستون‌هایی دارد؟
+    python -m sheet_filler.run fill    -c config.yaml          # یک بار پر کن
+    python -m sheet_filler.run fill    -c config.yaml --auto   # خودکار، تا وقتی نبندیدش
     python -m sheet_filler.run links   -c config.yaml --file sources.csv
     python -m sheet_filler.run status  -c config.yaml
 
@@ -85,28 +85,16 @@ def _options(context: Context, overrides: dict) -> filler.FillOptions:
 # ---------------------------------------------------------------------------
 
 
-@app.command("init-db")
-def init_db(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
-    """ساخت دیتابیس (یک فایل SQLite کنار خودِ برنامه)."""
-    configuration = load_config(config)
-    db.connect(configuration.db_path).close()
-    typer.secho(f"دیتابیس آماده است: {configuration.db_path}", fg=typer.colors.GREEN)
-
-
 @app.command("inspect")
 def inspect_command(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
-    sheet_id: Optional[str] = typer.Option(None, "--sheet-id"),
-    service_account: Optional[str] = typer.Option(None, "--service-account"),
+    sheet: Optional[str] = typer.Option(None, "--sheet", help="آدرس کامل گوگل‌شیت"),
     tab: Optional[str] = typer.Option(None, "--tab"),
     file: Optional[str] = typer.Option(None, "--file", help="به‌جای گوگل‌شیت، فایل csv/xlsx"),
 ) -> None:
     """شیت را می‌خواند و می‌گوید هر ستون چطور پر می‌شود — بدون نوشتن چیزی."""
     context = _open(config)
-    options = _options(
-        context,
-        {"sheet_id": sheet_id, "service_account_json": service_account, "tab": tab, "file": file},
-    )
+    options = _options(context, {"sheet_url": sheet, "tab": tab, "file": file})
     try:
         plan, rows, lists = filler.inspect(options)
     except gsheet.SheetError as exc:
@@ -129,25 +117,27 @@ def inspect_command(
 @app.command("fill")
 def fill_command(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
-    sheet_id: Optional[str] = typer.Option(None, "--sheet-id"),
-    service_account: Optional[str] = typer.Option(None, "--service-account"),
-    tab: Optional[str] = typer.Option(None, "--tab"),
-    file: Optional[str] = typer.Option(None, "--file"),
-    limit: int = typer.Option(0, "--limit", help="فقط این تعداد عنوان (۰ = همه)"),
-    overwrite: Optional[str] = typer.Option(
-        None, "--overwrite", help="empty = فقط سلول خالی، always = بازنویسی"
+    sheet: Optional[str] = typer.Option(
+        None, "--sheet", help="آدرس کامل گوگل‌شیت (شناسه‌اش خودکار درمی‌آید)"
     ),
+    tab: Optional[str] = typer.Option(None, "--tab"),
+    file: Optional[str] = typer.Option(None, "--file", help="به‌جای گوگل‌شیت، csv/xlsx محلی"),
+    limit: int = typer.Option(0, "--limit", help="فقط این تعداد ردیف (۰ = تا آخر شیت)"),
+    auto: bool = typer.Option(
+        False, "--auto", help="حلقه‌ی خودکار: پر کن، بخواب، دوباره شیت را بخوان"
+    ),
+    every: int = typer.Option(0, "--every", help="فاصله‌ی دورهای خودکار به دقیقه"),
     save: bool = typer.Option(False, "--save", help="این تنظیمات برای دفعه‌ی بعد ذخیره شود"),
 ) -> None:
     """پر کردن ستون‌های شیت از روی سایت‌های منبع."""
     context = _open(config)
     overrides = {
-        "sheet_id": sheet_id,
-        "service_account_json": service_account,
+        "sheet_url": sheet,
         "tab": tab,
         "file": file,
         "limit": limit or None,
-        "overwrite": overwrite,
+        "auto": auto or None,
+        "auto_every_minutes": every or None,
     }
     if save:
         stored = db.get_setting(context.conn, "settings", {}) or {}
@@ -156,26 +146,42 @@ def fill_command(
         typer.secho("تنظیمات ذخیره شد.", fg=typer.colors.BRIGHT_BLACK)
 
     options = _options(context, overrides)
-    if not (options.sheet.sheet_id or options.sheet.file):
+    if not options.ready:
         context.close()
         _fail(
-            "نه شناسه‌ی گوگل‌شیت داده شده و نه فایل ورودی.\n"
+            "نه آدرس گوگل‌شیت داده شده و نه فایل ورودی.\n"
             "  نمونه: python -m sheet_filler.run fill -c config.yaml"
-            " --sheet-id 1AbC... --service-account service.json"
+            " --sheet https://docs.google.com/spreadsheets/d/..."
         )
         return
     try:
-        with http.fetcher_from_config(context.config) as fetcher:
-            stats = filler.run(
+        if options.auto:
+            typer.secho(
+                f"حالت خودکار: هر {options.auto_every_minutes} دقیقه یک‌بار."
+                " برای توقف Ctrl+C بزنید.",
+                fg=typer.colors.CYAN,
+            )
+            stats = filler.run_auto(
                 context.conn,
                 context.config,
                 options,
-                fetcher,
+                lambda: http.fetcher_from_config(context.config),
                 log=lambda line: typer.echo(f"  {line}"),
             )
+        else:
+            with http.fetcher_from_config(context.config) as fetcher:
+                stats = filler.run(
+                    context.conn,
+                    context.config,
+                    options,
+                    fetcher,
+                    log=lambda line: typer.echo(f"  {line}"),
+                )
         typer.echo(stats.render())
     except gsheet.SheetError as exc:
         _fail(str(exc))
+    except KeyboardInterrupt:
+        typer.secho("\nمتوقف شد؛ ردیف‌های پرشده محفوظ‌اند.", fg=typer.colors.YELLOW)
     finally:
         context.close()
 
@@ -267,19 +273,6 @@ def panel_command(
         typer.secho("\nپنل بسته شد.", fg=typer.colors.YELLOW)
     finally:
         httpd.server_close()
-
-
-@app.command("keyword")
-def keyword_command(
-    text: str = typer.Argument(..., help="یک عنوان نمونه"),
-    config: Optional[str] = typer.Option(None, "--config", "-c"),
-) -> None:
-    """ابزار کمکی: کلمه‌ی کلیدی یک عنوان چه می‌شود؟"""
-    configuration = load_config(config)
-    norm_config = normalizer.config_from_mapping(configuration.get("normalizer", {}))
-    typer.echo(f"عنوان        : {text}")
-    typer.echo(f"کلمه کلیدی   : {normalizer.main_keyword(text, norm_config)}")
-    typer.echo(f"کلید تطبیق   : {normalizer.normalize(text, norm_config)}")
 
 
 def main() -> None:  # pragma: no cover

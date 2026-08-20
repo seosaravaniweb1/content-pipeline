@@ -18,7 +18,8 @@
 
 * **از سر گرفتنی است.** هر ردیف بلافاصله در دیتابیس می‌نشیند و صفحه‌های
   دانلودشده کش می‌شوند؛ اجرای بعدی از همان‌جا ادامه می‌دهد.
-* **سقف نشست دارد** تا یک اجرای بی‌نظارتِ چندساعته راه نیفتد.
+* **حالت خودکار دارد**: روشنش کنید و دیگر کاری ندارید — هر چند دقیقه یک‌بار
+  شیت را می‌خواند و ردیف‌های تازه را پر می‌کند.
 * **ستون‌های «وضعیت» و «شناسه محصول» دست نمی‌خورند**؛ آن‌ها مالِ اسکریپت درج
   محصول‌اند.
 """
@@ -28,9 +29,20 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
-from . import consensus, db, details, fields, gsheet, images, normalizer, sources, taxonomy
+from . import (
+    consensus,
+    db,
+    details,
+    fields,
+    gsheet,
+    images,
+    normalizer,
+    settings,
+    sources,
+    taxonomy,
+)
 from .config import Config, SourceSite
 from .details import PageDetails
 from .http import Fetcher
@@ -52,6 +64,14 @@ KIND_LABELS = {
     fields.KIND_SKIP: "دست نمی‌خورد",
 }
 
+#: برچسب فارسی مقدارهای استاندارد (ملیت و فرمت)
+DEFAULT_LABELS = {
+    "iranian": "ایرانی",
+    "foreign": "خارجی",
+    "pdf": "پی دی اف",
+    "audio": "صوتی",
+}
+
 #: واژگان پیش‌فرض برای ستون‌های شناخته‌شده (اگر تبِ «لیست‌ها» چیزی نداشت)
 DEFAULT_VOCABULARIES = {
     "categories": taxonomy.DEFAULT_CATEGORIES,
@@ -66,27 +86,39 @@ DEFAULT_VOCABULARIES = {
 
 @dataclass
 class FillOptions:
-    """تنظیمات یک اجرا: config به‌علاوه‌ی چیزی که در پنل عوض شده."""
+    """تنظیمات یک اجرا.
+
+    **این کلاس تنها جای تعریف مقدارهای پیش‌فرض است.** ``config.yaml`` و پنل
+    فقط چیزهایی را می‌فرستند که کاربر عوض کرده؛ بقیه همین‌جا می‌مانند. پس یک
+    تنظیم هیچ‌وقت دو مقدار پیش‌فرضِ ناهماهنگ ندارد.
+    """
 
     sheet: gsheet.SheetSettings = field(default_factory=gsheet.SheetSettings)
     image: images.ImageRules = field(default_factory=images.ImageRules)
     sites: list[SourceSite] = field(default_factory=list)
+
+    # -- چیزهایی که کاربر تصمیم می‌گیرد ------------------------------------
     overwrite: str = "empty"
-    retry_partial: bool = False
     limit: int = 0
-    max_titles_per_session: int = 0
-    max_pages_per_session: int = 0
     max_sources_per_title: int = 5
+    retry_partial: bool = False
+    #: حالت خودکار: خودش هر چند دقیقه شیت را می‌خواند و ردیف‌های تازه را پر می‌کند
+    auto: bool = False
+    auto_every_minutes: int = 30
+
+    # -- چیزهایی که برنامه خودش می‌داند (قابل تغییر از config، نه از پنل) ----
     min_title_similarity: float = 0.72
     search_enabled: bool = True
     max_results_per_site: int = 8
-    batch_rows: int = 100
+    batch_rows: int = 50
     cache_ttl_days: int = 30
+    #: ردیف بی‌منبع، بعد از این مدت دوباره امتحان می‌شود (منابع تازه اضافه می‌شوند)
+    retry_after_days: int = 7
     separator: str = "، "
     max_categories: int = 3
     max_tags: int = 5
     combine_author_scripts: bool = True
-    labels: dict = field(default_factory=dict)
+    labels: dict = field(default_factory=lambda: dict(DEFAULT_LABELS))
     summary: dict = field(default_factory=dict)
     numbers: dict = field(default_factory=dict)
     taxonomy: dict = field(default_factory=dict)
@@ -99,57 +131,72 @@ class FillOptions:
     def key(self) -> str:
         return db.sheet_key(self.sheet.sheet_id, self.sheet.tab, self.sheet.file)
 
+    @property
+    def ready(self) -> bool:
+        return bool(self.sheet.sheet_id or self.sheet.file)
 
+
+#: کلیدهایی که مستقیم روی ``FillOptions`` می‌نشینند
+_SIMPLE_KEYS = {
+    name
+    for name in FillOptions.__dataclass_fields__
+    if name not in {"sheet", "image", "sites", "labels", "summary", "numbers", "taxonomy"}
+}
 def options_from_config(config: Config, overrides: dict | None = None) -> FillOptions:
     """``config.yaml`` + تنظیمات پنل → :class:`FillOptions`.
 
-    تنظیمات پنل روی config سوار می‌شوند: کاربر همین حالا آنجا نشسته و همان
-    چیزی که می‌بیند باید اجرا شود.
+    یک مسیر ادغام، نه چهار تا: هر چه در config است با هر چه کاربر در پنل عوض
+    کرده یکی می‌شود، تایپ‌ها تمیز می‌شوند و بعد روی پیش‌فرض‌های همین ماژول
+    می‌نشیند.
     """
-    sheet_raw = dict(config.get("sheet", {}) or {})
-    fill_raw = dict(config.get("fill", {}) or {})
-    search_raw = dict(config.get("search", {}) or {})
-    image_raw = dict(config.get("image", {}) or {})
-    sites = list(config.sites)
+    merged: dict[str, Any] = {}
+    for block in ("sheet", "fill", "image"):
+        merged.update(config.get(block, {}) or {})
+    merged["search_enabled"] = bool(config.get("search.enabled", True))
+    merged["max_results_per_site"] = int(config.get("search.max_results_per_site", 8))
+    merged["sites"] = list(config.get("sites", []) or [])
+    merged.update(settings.normalize(overrides or {}))
+    # بلوک ``search`` هم به‌شکل دیکشنری پذیرفته می‌شود (همان شکلی که در
+    # config.yaml نوشته می‌شود)، تا یک تنظیم دو اسم نداشته باشد.
+    if isinstance(merged.get("search"), dict):
+        block = merged.pop("search")
+        if "enabled" in block:
+            merged["search_enabled"] = bool(block["enabled"])
+        if "max_results_per_site" in block:
+            merged["max_results_per_site"] = int(block["max_results_per_site"])
 
-    for key, value in (overrides or {}).items():
-        if key in {"sheet", "fill", "search", "image"} and isinstance(value, dict):
-            target = {"sheet": sheet_raw, "fill": fill_raw, "search": search_raw, "image": image_raw}[key]
-            target.update({k: v for k, v in value.items() if v is not None})
-        elif key == "sites" and isinstance(value, list):
-            default_search = search_raw.get("url_template", "{base}/?s={query}")
-            sites = [SourceSite.from_entry(entry, default_search) for entry in value if entry]
-        elif key in sheet_raw or key in {"sheet_id", "service_account_json", "tab", "file"}:
-            sheet_raw[key] = value
-        elif value not in (None, ""):
-            fill_raw[key] = value
+    # --- چیزهایی که خودکار فهمیده می‌شوند --------------------------------
+    sheet_id = settings.sheet_id_from(merged.get("sheet_url") or merged.get("sheet_id") or "")
+    if sheet_id:
+        merged["sheet_id"] = sheet_id
+    if merged.get("sheet_id"):
+        merged["service_account_json"] = settings.find_service_account(
+            merged.get("service_account_json", ""), config.path
+        )
 
-    labels = dict(config.get("fill.labels", {}) or {})
-    labels.update(fill_raw.get("labels", {}) or {})
-    return FillOptions(
-        sheet=gsheet.SheetSettings.from_mapping(sheet_raw),
-        image=images.ImageRules.from_mapping(image_raw),
-        sites=sites,
-        overwrite=str(fill_raw.get("overwrite", "empty") or "empty"),
-        retry_partial=bool(fill_raw.get("retry_partial", False)),
-        limit=int(fill_raw.get("limit", 0) or 0),
-        max_titles_per_session=int(fill_raw.get("max_titles_per_session", 0) or 0),
-        max_pages_per_session=int(fill_raw.get("max_pages_per_session", 0) or 0),
-        max_sources_per_title=max(1, int(fill_raw.get("max_sources_per_title", 5) or 5)),
-        min_title_similarity=float(fill_raw.get("min_title_similarity", 0.72) or 0.72),
-        search_enabled=bool(search_raw.get("enabled", True)),
-        max_results_per_site=int(search_raw.get("max_results_per_site", 8) or 8),
-        batch_rows=max(1, int(fill_raw.get("batch_rows", 100) or 100)),
-        cache_ttl_days=int(fill_raw.get("cache_ttl_days", 30) or 30),
-        separator=str(fill_raw.get("multi_select_separator", "، ")),
-        max_categories=int(fill_raw.get("max_categories", 3) or 3),
-        max_tags=int(fill_raw.get("max_tags", 5) or 5),
-        combine_author_scripts=bool(fill_raw.get("combine_author_scripts", True)),
-        labels=labels,
-        summary=dict(fill_raw.get("summary", {}) or {}),
-        numbers=dict(fill_raw.get("numbers", {}) or {}),
-        taxonomy=dict(fill_raw.get("taxonomy", {}) or {}),
+    options = FillOptions(
+        sheet=gsheet.SheetSettings.from_mapping(merged),
+        image=images.ImageRules.from_mapping(
+            {**(config.get("image", {}) or {}), "enabled": merged.get("image", True)}
+        ),
+        sites=_sites_from(merged, config),
     )
+    for key, value in merged.items():
+        if key in _SIMPLE_KEYS and value is not None:
+            setattr(options, key, value)
+    labels = dict(DEFAULT_LABELS)
+    labels.update(config.get("fill.labels", {}) or {})
+    options.labels = labels
+    options.summary = dict(config.get("fill.summary", {}) or {})
+    options.numbers = dict(config.get("fill.numbers", {}) or {})
+    options.taxonomy = dict(config.get("fill.taxonomy", {}) or {})
+    return options
+
+
+def _sites_from(merged: dict, config: Config) -> list[SourceSite]:
+    default_search = config.get("search.url_template", "{base}/?s={query}")
+    entries = merged.get("sites") or []
+    return [SourceSite.from_entry(entry, default_search) for entry in entries if entry]
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +527,197 @@ def inspect(
     return plan, rows, lists
 
 
+@dataclass
+class _Job:
+    """چیزهایی که یک اجرا از اول تا آخر با خودش می‌برد."""
+
+    conn: sqlite3.Connection
+    options: FillOptions
+    document: gsheet.Document
+    plan: fields.FieldPlan
+    specs: list[fields.FieldSpec]
+    rows: list[gsheet.SheetRow]
+    norm_config: normalizer.NormalizerConfig
+    fetcher: Fetcher
+    say: LogFn
+    stats: FillStats = field(default_factory=FillStats)
+    updates: list[gsheet.CellUpdate] = field(default_factory=list)
+    ids: list[int] = field(default_factory=list)
+    report_rows: list[list[object]] = field(default_factory=list)
+
+    @property
+    def targets(self) -> list[str]:
+        return [spec.key for spec in self.specs]
+
+    @property
+    def titles(self) -> dict[str, str]:
+        return {spec.key: spec.column for spec in self.specs}
+
+
+def prepare(
+    conn: sqlite3.Connection,
+    config: Config,
+    options: FillOptions,
+    fetcher: Fetcher,
+    document: gsheet.Document | None,
+    say: LogFn,
+) -> _Job:
+    """خواندن شیت، ساخت نقشه‌ی ستون‌ها و گزارش آنچه دیده شد."""
+    document = document or gsheet.open_document(options.sheet)
+    plan, rows, lists = inspect(options, document)
+    job = _Job(
+        conn=conn,
+        options=options,
+        document=document,
+        plan=plan,
+        specs=options.writable(plan),
+        rows=rows,
+        norm_config=normalizer.config_from_mapping(config.get("normalizer", {})),
+        fetcher=fetcher,
+        say=say,
+    )
+    job.stats.rows = len(rows)
+    say(f"شیت خوانده شد: {len(rows)} ردیف")
+    say(
+        "ستون‌ها — "
+        + "، ".join(f"{col}: {KIND_LABELS.get(kind, kind)}" for col, kind in plan.describe().items())
+    )
+    if lists:
+        say("لیست‌ها — " + "، ".join(f"{name}: {len(values)}" for name, values in lists.items()))
+    if not job.specs:
+        say("⚠ هیچ ستون قابل نوشتنی پیدا نشد؛ فقط دیتابیس پر می‌شود.")
+
+    db.remember_sheet(
+        conn,
+        options.key,
+        options.sheet.tab or options.sheet.file or options.sheet.sheet_id,
+        [{"column": s.column, "key": s.key, "kind": s.kind} for s in plan.specs],
+    )
+    return job
+
+
+def build_queue(job: _Job) -> list[tuple[gsheet.SheetRow, int, list[str]]]:
+    """ردیف‌هایی که باید کار شوند، به‌ترتیب خودِ شیت."""
+    options, conn = job.options, job.conn
+    queue: list[tuple[gsheet.SheetRow, int, list[str]]] = []
+    with db.transaction(conn):
+        for row in job.rows:
+            title_key = normalizer.normalize(row.title, job.norm_config)
+            row_id = db.upsert_row(conn, options.key, row.title, title_key, row.number)
+            wanted = job.targets if options.overwrite == "always" else row.empty_fields(job.targets)
+            if wanted and _needs_work(conn, options.key, title_key, options):
+                queue.append((row, row_id, wanted))
+    job.stats.queued = len(queue)
+    if options.limit and options.limit < len(queue):
+        job.say(f"سقف این اجرا: {options.limit} ردیف از {len(queue)} ردیفِ در صف")
+        queue = queue[: options.limit]
+    return queue
+
+
+def process_row(job: _Job, row: gsheet.SheetRow, row_id: int, wanted: list[str]) -> None:
+    """یک ردیف: منابعش را پیدا کن، مقدارها را بساز، ذخیره کن."""
+    options, conn, stats = job.options, job.conn, job.stats
+    title_key = normalizer.normalize(row.title, job.norm_config)
+    pages, source_stats = sources.collect(
+        conn,
+        row.title,
+        title_key,
+        _ordered_sites(conn, options),
+        job.fetcher,
+        known_urls=_known_urls(row, _sources_column(job.plan, options)),
+        max_sources=options.max_sources_per_title,
+        min_similarity=options.min_title_similarity,
+        search_enabled=options.search_enabled,
+        max_results_per_site=options.max_results_per_site,
+        cache_ttl_days=options.cache_ttl_days,
+        norm_config=job.norm_config,
+    )
+    stats.pages_fetched += source_stats.fetched
+    stats.from_cache += source_stats.from_cache
+    stats.processed += 1
+
+    if not pages:
+        stats.no_source += 1
+        with db.transaction(conn):
+            db.save_values(conn, row_id, {}, status=db.PARTIAL, note="هیچ صفحه‌ی منبعی پیدا نشد")
+        job.report_rows.append(
+            report_row(row.number, row.title, "بدون منبع", 0, job.specs, {}, {}, "منبعی پیدا نشد")
+        )
+        return
+
+    pick = _pick_image(pages, options, job.fetcher)
+    values, evidence, _ = build_values(
+        row.title, pages, options, job.specs, job.norm_config, image_pick=pick
+    )
+
+    required = [
+        spec.key for spec in job.specs if spec.required and _expected(spec, values, options)
+    ]
+    missing = [name for name in required if name in wanted and not values.get(name)]
+    status = db.DONE if not missing else db.PARTIAL
+    note = "" if not missing else "پر نشد: " + "، ".join(job.titles.get(n, n) for n in missing)
+    with db.transaction(conn):
+        db.save_values(
+            conn,
+            row_id,
+            values,
+            sources=[page.url for page in pages],
+            evidence=evidence,
+            status=status,
+            note=note,
+        )
+        # دامنه‌هایی که جواب دادند یاد گرفته می‌شوند: دفعه‌ی بعد اول از همان‌ها
+        for page in pages:
+            db.note_domain(conn, page.domain)
+    stats.completed += int(status == db.DONE)
+    stats.partial += int(status == db.PARTIAL)
+
+    for name in wanted:
+        value = values.get(name, "")
+        column = job.plan.columns.get(name)
+        if not value or column is None:
+            continue
+        job.updates.append(gsheet.CellUpdate(row.number, column, value))
+        label = job.titles.get(name, name)
+        stats.filled[label] = stats.filled.get(label, 0) + 1
+    job.ids.append(row_id)
+
+    job.report_rows.append(
+        report_row(
+            row.number,
+            row.title,
+            "کامل" if status == db.DONE else "ناقص",
+            len(pages),
+            job.specs,
+            values,
+            evidence,
+            note,
+        )
+    )
+
+
+def finish(job: _Job) -> FillStats:
+    """نوشتن باقی‌مانده‌ها، گزارش و بستن سند."""
+    options, stats = job.options, job.stats
+    stats.cells_written += _flush(job.conn, job.document, job.updates, job.ids)
+    job.updates, job.ids = [], []
+
+    if options.sheet.report_tab and job.report_rows:
+        try:
+            stats.report = job.document.write_report(
+                options.sheet.report_tab, report_header(job.specs), job.report_rows
+            )
+        except Exception as exc:  # noqa: BLE001 — گزارش نباید کل اجرا را بیندازد
+            job.say(f"⚠ نوشتن تبِ گزارش نشد: {exc}")
+
+    closed = job.document.close()
+    if isinstance(job.document, gsheet.GoogleSheetDocument):
+        stats.sheet_url = closed or ""
+    else:
+        stats.output_path = closed or ""
+    return stats
+
+
 def run(
     conn: sqlite3.Connection,
     config: Config,
@@ -489,176 +727,120 @@ def run(
     log: LogFn | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> FillStats:
-    """پر کردن شیت. خروجی، خلاصه‌ی همین اجراست."""
+    """پر کردن شیت — یک بار، از اول تا آخر."""
     say: LogFn = log or print
     stop = should_stop or (lambda: False)
-    norm_config = normalizer.config_from_mapping(config.get("normalizer", {}))
-    stats = FillStats()
-    key = options.key
 
-    document = document or gsheet.open_document(options.sheet)
-    plan, sheet_rows, lists = inspect(options, document)
-    stats.rows = len(sheet_rows)
-    say(f"شیت خوانده شد: {len(sheet_rows)} ردیف")
-    say(
-        "ستون‌ها — "
-        + "، ".join(f"{col}: {KIND_LABELS.get(kind, kind)}" for col, kind in plan.describe().items())
-    )
-    if lists:
-        say("لیست‌ها — " + "، ".join(f"{name}: {len(values)}" for name, values in lists.items()))
-
-    specs = options.writable(plan)
-    targets = [spec.key for spec in specs]
-    titles = {spec.key: spec.column for spec in specs}
-    db.remember_sheet(
-        conn,
-        key,
-        options.sheet.tab or options.sheet.file or options.sheet.sheet_id,
-        [{"column": s.column, "key": s.key, "kind": s.kind} for s in plan.specs],
-    )
-    if not targets:
-        say("⚠ هیچ ستون قابل نوشتنی پیدا نشد؛ فقط دیتابیس پر می‌شود.")
-
-    recovered = _push_unwritten(conn, key, document, plan.columns, targets, sheet_rows, options)
+    job = prepare(conn, config, options, fetcher, document, say)
+    recovered = _push_unwritten(job)
     if recovered:
-        stats.cells_written += recovered
+        job.stats.cells_written += recovered
         say(f"{recovered} سلول از اجرای قبلی که به شیت نرسیده بود، نوشته شد.")
 
-    queue: list[tuple[gsheet.SheetRow, int, list[str]]] = []
-    with db.transaction(conn):
-        for row in sheet_rows:
-            title_key = normalizer.normalize(row.title, norm_config)
-            row_id = db.upsert_row(conn, key, row.title, title_key, row.number)
-            wanted = targets if options.overwrite == "always" else row.empty_fields(targets)
-            if wanted and _needs_work(conn, key, title_key, options):
-                queue.append((row, row_id, wanted))
-    stats.queued = len(queue)
-
-    caps = [value for value in (options.limit, options.max_titles_per_session) if value > 0]
-    cap = min(caps) if caps else 0
-    if cap and cap < len(queue):
-        say(f"سقف این نشست: {cap} عنوان از {len(queue)} عنوانِ در صف")
-        queue = queue[:cap]
-
-    pending_updates: list[gsheet.CellUpdate] = []
-    pending_ids: list[int] = []
-    report_rows: list[list[object]] = []
-    sources_column = _sources_column(plan, options)
-
+    queue = build_queue(job)
     for index, (row, row_id, wanted) in enumerate(queue, start=1):
         if stop():
-            stats.stopped_early = "به درخواست شما متوقف شد؛ بقیه‌ی ردیف‌ها در صف ماندند."
+            job.stats.stopped_early = "به درخواست شما متوقف شد؛ بقیه‌ی ردیف‌ها در صف ماندند."
             break
-        if options.max_pages_per_session and stats.pages_fetched >= options.max_pages_per_session:
-            stats.stopped_early = (
-                f"به سقف {options.max_pages_per_session} صفحه در این نشست رسیدیم؛"
-                " دوباره اجرا کنید تا از همین‌جا ادامه دهد."
-            )
-            break
-
-        title_key = normalizer.normalize(row.title, norm_config)
-        known = _known_urls(row, sources_column)
-        pages, source_stats = sources.collect(
-            conn,
-            row.title,
-            title_key,
-            options.sites,
-            fetcher,
-            known_urls=known,
-            max_sources=options.max_sources_per_title,
-            min_similarity=options.min_title_similarity,
-            search_enabled=options.search_enabled,
-            max_results_per_site=options.max_results_per_site,
-            cache_ttl_days=options.cache_ttl_days,
-            norm_config=norm_config,
-        )
-        stats.pages_fetched += source_stats.fetched
-        stats.from_cache += source_stats.from_cache
-        stats.processed += 1
-
-        if not pages:
-            stats.no_source += 1
-            with db.transaction(conn):
-                db.save_values(
-                    conn, row_id, {}, status=db.PARTIAL, note="هیچ صفحه‌ی منبعی پیدا نشد"
-                )
-            report_rows.append(
-                report_row(row.number, row.title, "بدون منبع", 0, specs, {}, {}, "منبعی پیدا نشد")
-            )
-            continue
-
-        pick = _pick_image(pages, options, fetcher)
-        values, evidence, _ = build_values(
-            row.title, pages, options, specs, norm_config, image_pick=pick
-        )
-
-        required = [spec.key for spec in specs if spec.required and _expected(spec, values, options)]
-        missing = [name for name in required if name in wanted and not values.get(name)]
-        status = db.DONE if not missing else db.PARTIAL
-        note = "" if not missing else "پر نشد: " + "، ".join(titles.get(n, n) for n in missing)
-        with db.transaction(conn):
-            db.save_values(
-                conn,
-                row_id,
-                values,
-                sources=[page.url for page in pages],
-                evidence=evidence,
-                status=status,
-                note=note,
-            )
-        stats.completed += int(status == db.DONE)
-        stats.partial += int(status == db.PARTIAL)
-
-        for name in wanted:
-            value = values.get(name, "")
-            column = plan.columns.get(name)
-            if not value or column is None:
-                continue
-            pending_updates.append(gsheet.CellUpdate(row.number, column, value))
-            label = titles.get(name, name)
-            stats.filled[label] = stats.filled.get(label, 0) + 1
-        pending_ids.append(row_id)
-
-        report_rows.append(
-            report_row(
-                row.number,
-                row.title,
-                "کامل" if status == db.DONE else "ناقص",
-                len(pages),
-                specs,
-                values,
-                evidence,
-                note,
-            )
-        )
-
-        if len(pending_ids) >= options.batch_rows:
-            stats.cells_written += _flush(conn, document, pending_updates, pending_ids)
-            pending_updates, pending_ids = [], []
+        process_row(job, row, row_id, wanted)
+        if len(job.ids) >= options.batch_rows:
+            job.stats.cells_written += _flush(conn, job.document, job.updates, job.ids)
+            job.updates, job.ids = [], []
         if index % 10 == 0:
-            say(f"  {index}/{len(queue)} — نوشته‌شده: {stats.cells_written} سلول")
+            say(f"  {index}/{len(queue)} — نوشته‌شده: {job.stats.cells_written} سلول")
+    return finish(job)
 
-    stats.cells_written += _flush(conn, document, pending_updates, pending_ids)
 
-    if options.sheet.report_tab and report_rows:
+def run_auto(
+    conn: sqlite3.Connection,
+    config: Config,
+    options: FillOptions,
+    fetcher_factory: Callable[[], Fetcher],
+    log: LogFn | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    rounds: int = 0,
+) -> FillStats:
+    """حالت خودکار: پر کن، بخواب، دوباره شیت را بخوان.
+
+    این همان چیزی است که در عمل لازم است: عنوان تازه را در شیت می‌گذارید و
+    بدون اینکه دکمه‌ای بزنید پر می‌شود. بین دورها می‌خوابیم چون شیت مدام عوض
+    نمی‌شود و درخواست بی‌دلیل به سایت‌های منبع هم کند است هم بی‌ادبانه.
+
+    ``rounds`` صفر یعنی بی‌نهایت (تا وقتی لغو شود)؛ عدد مثبت برای تست.
+    """
+    import time
+
+    say: LogFn = log or print
+    stop = should_stop or (lambda: False)
+    nap = sleep or time.sleep
+    total = FillStats()
+    round_number = 0
+
+    while not stop():
+        round_number += 1
+        fetcher = fetcher_factory()
         try:
-            stats.report = document.write_report(
-                options.sheet.report_tab, report_header(specs), report_rows
-            )
-        except Exception as exc:  # noqa: BLE001 — گزارش نباید کل اجرا را بیندازد
-            say(f"⚠ نوشتن تبِ گزارش نشد: {exc}")
+            stats = run(conn, config, options, fetcher, log=say, should_stop=stop)
+        finally:
+            close = getattr(fetcher, "close", None)
+            if close:
+                close()
+        _accumulate(total, stats)
 
-    closed = document.close()
-    if isinstance(document, gsheet.GoogleSheetDocument):
-        stats.sheet_url = closed or ""
-    else:
-        stats.output_path = closed or ""
-    return stats
+        if (rounds and round_number >= rounds) or stop():
+            break
+        minutes = max(1, int(options.auto_every_minutes or 30))
+        say(f"⏳ دور {round_number} تمام شد؛ {minutes} دقیقه‌ی دیگر دوباره سراغ شیت می‌روم.")
+        # خواب تکه‌تکه تا «لغو» زودتر از چند دقیقه جواب بدهد
+        for _ in range(minutes * 6):
+            if stop():
+                break
+            nap(10)
+    total.stopped_early = total.stopped_early or f"{round_number} دور اجرا شد."
+    return total
+
+
+def _accumulate(total: FillStats, stats: FillStats) -> None:
+    total.rows = stats.rows
+    for name in (
+        "queued",
+        "processed",
+        "completed",
+        "partial",
+        "no_source",
+        "pages_fetched",
+        "from_cache",
+        "cells_written",
+    ):
+        setattr(total, name, getattr(total, name) + getattr(stats, name))
+    for key, value in stats.filled.items():
+        total.filled[key] = total.filled.get(key, 0) + value
+    total.sheet_url = stats.sheet_url or total.sheet_url
+    total.output_path = stats.output_path or total.output_path
+    total.report = stats.report or total.report
 
 
 # ---------------------------------------------------------------------------
 # کمکی‌ها
 # ---------------------------------------------------------------------------
+
+
+def _ordered_sites(conn: sqlite3.Connection, options: FillOptions) -> list[SourceSite]:
+    """سایت‌ها به ترتیب «کدام تا حالا بیشتر جواب داده».
+
+    اگر هیچ سایتی تنظیم نشده باشد، از دامنه‌ی لینک‌های ایمپورت‌شده ساخته
+    می‌شود: کاربری که آدرس‌ها را داده، عملاً سایت‌ها را هم داده.
+    """
+    sites = list(options.sites)
+    if not sites:
+        sites = [
+            SourceSite.from_entry(f"https://{domain}", "{base}/?s={query}")
+            for domain in db.known_domains(conn)
+        ]
+    scores = db.domain_scores(conn)
+    sites.sort(key=lambda site: -scores.get(site.domain, 0))
+    return sites
 
 
 def _sources_column(plan: fields.FieldPlan, options: FillOptions) -> str:
@@ -697,6 +879,11 @@ def _needs_work(
     ستون خالی به‌تنهایی دلیل کافی نیست: «مترجم» یک اثر ایرانی همیشه خالی
     می‌ماند و اگر ملاک فقط خالی بودن سلول باشد، هر اجرا همان ردیف‌ها را از نو
     می‌گردد.
+
+    ولی ردیفی که **منبعی برایش پیدا نشد** فرق دارد: شاید سایت تازه‌ای اضافه
+    کرده‌اید یا منبعی محصول را دیرتر گذاشته. چنین ردیفی بعد از
+    ``retry_after_days`` خودبه‌خود دوباره امتحان می‌شود، بدون اینکه کاربر
+    دکمه‌ای بزند.
     """
     if options.overwrite == "always":
         return True
@@ -706,7 +893,12 @@ def _needs_work(
     status = row["status"] or db.PENDING
     if status == db.PENDING:
         return True
-    return status == db.PARTIAL and options.retry_partial
+    if status != db.PARTIAL:
+        return False
+    if options.retry_partial:
+        return True
+    note = row["note"] or ""
+    return "منبع" in note and db.older_than(row["updated_at"], options.retry_after_days)
 
 
 def _flush(
@@ -722,40 +914,35 @@ def _flush(
     return written
 
 
-def _push_unwritten(
-    conn: sqlite3.Connection,
-    key: str,
-    document: gsheet.Document,
-    columns: dict[str, int],
-    targets: Sequence[str],
-    sheet_rows: Sequence[gsheet.SheetRow],
-    options: FillOptions,
-) -> int:
+def _push_unwritten(job: _Job) -> int:
     """ردیف‌هایی که در دیتابیس کامل شده‌اند ولی به شیت نرسیده‌اند.
 
     اگر اجرای قبلی وسط نوشتن قطع شده باشد (اینترنت، بسته شدن پنل، سهمیه‌ی
     گوگل)، مقدارها هست ولی ردیف «انجام‌شده» علامت خورده — بدون این مرحله
     دیگر هیچ‌وقت نوشته نمی‌شدند.
     """
-    pending = db.unpushed_rows(conn, key)
-    if not pending or not targets:
+    options = job.options
+    pending = db.unpushed_rows(job.conn, options.key)
+    if not pending or not job.specs:
         return 0
-    by_number = {row.number: row for row in sheet_rows}
+    by_number = {row.number: row for row in job.rows}
     updates: list[gsheet.CellUpdate] = []
     ids: list[int] = []
     for record in pending:
         sheet_row = by_number.get(int(record["row_number"] or 0))
         if sheet_row is None:
             continue
-        allowed = targets if options.overwrite == "always" else sheet_row.empty_fields(targets)
+        allowed = (
+            job.targets if options.overwrite == "always" else sheet_row.empty_fields(job.targets)
+        )
         stored = db.row_values(record)
         for name in allowed:
-            column = columns.get(name)
+            column = job.plan.columns.get(name)
             value = stored.get(name, "")
             if column is not None and value:
                 updates.append(gsheet.CellUpdate(sheet_row.number, column, str(value)))
         ids.append(int(record["id"]))
-    return _flush(conn, document, updates, ids)
+    return _flush(job.conn, job.document, updates, ids)
 
 
 def _pick_image(

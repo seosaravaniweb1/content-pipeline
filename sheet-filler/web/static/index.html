@@ -16,65 +16,50 @@
   <div class="head-actions">
     <span class="muted" id="headStatus"></span>
     <button id="runBtn" class="primary">اجرا</button>
-    <button id="cancelBtn" class="danger" disabled>لغو</button>
+    <button id="cancelBtn" class="danger" disabled>توقف</button>
   </div>
 </header>
 
 <nav id="tabs">
-  <button data-tab="sheet" class="active">شیت</button>
-  <button data-tab="sources">منابع</button>
-  <button data-tab="rules">قواعد</button>
+  <button data-tab="setup" class="active">شروع</button>
   <button data-tab="run">اجرا و لاگ</button>
   <button data-tab="rows">ردیف‌ها</button>
-  <button data-tab="config">تنظیمات فایل</button>
 </nav>
 
 <div id="toast" hidden></div>
 
 <main>
-  <!-- ------------------------------------------------------------ شیت -->
-  <section id="tab-sheet" class="tab active">
+  <!-- ----------------------------------------------------------- شروع -->
+  <section id="tab-setup" class="tab active">
     <div class="panel">
-      <h2>۱. شیت محصولات</h2>
+      <h2>۱. شیت و منابع</h2>
       <p class="muted">
-        همان شیتی که بعداً به اسکریپت درج محصول می‌دهید. عنوان‌ها را شما در ستون اول
-        گذاشته‌اید؛ این برنامه بقیه‌ی ستون‌ها را از روی سایت‌های منبع پر می‌کند.
+        آدرس شیت را از نوار مرورگر کپی کنید و سایت‌های منبع را بچسبانید. بقیه‌ی
+        چیزها خودکار است: شناسه‌ی شیت از آدرس درمی‌آید، فایل سرویس‌اکانت اگر کنار
+        <code>config.yaml</code> باشد پیدا می‌شود، و ستون‌ها از خودِ شیت خوانده می‌شوند.
       </p>
-      <div class="warn">
-        <b>سه کار قبل از اولین اجرا:</b><br>
-        ۱. <code dir="ltr">pip install gspread</code><br>
-        ۲. در Google Cloud یک <b>service account</b> بسازید و فایل json کلیدش را دانلود کنید.<br>
-        ۳. شیت را با ایمیل همان service account، با دسترسی <b>ویرایشگر</b>، به اشتراک بگذارید.<br>
-        شناسه‌ی شیت همان تکه‌ی وسط آدرس است:
-        <code dir="ltr">docs.google.com/spreadsheets/d/<b>SHEET_ID</b>/edit</code>
-      </div>
-      <table class="kv">
-        <tr><td>شناسه‌ی شیت</td><td><input id="sheetId" dir="ltr" placeholder="1AbC...xyz"></td></tr>
-        <tr><td>فایل service account</td><td><input id="serviceAccount" dir="ltr" placeholder="C:\keys\service.json"></td></tr>
-        <tr><td>تبِ محصولات</td><td><input id="tab" placeholder="خالی = اولین تب"></td></tr>
-        <tr><td>تبِ لیست‌ها</td><td><input id="listsTab" placeholder="لیست‌ها"></td></tr>
-        <tr><td>تبِ گزارش</td><td><input id="reportTab" placeholder="گزارش تکمیل — خالی = ننویس"></td></tr>
-        <tr><td>سطر عنوان ستون‌ها</td><td><input id="headerRow" type="number" min="1" value="1"></td></tr>
-        <tr><td>ستون عنوان</td><td><input id="titleColumn" placeholder="خالی = ستون اول"></td></tr>
-        <tr><td>ستون آدرس منابع</td><td><input id="sourcesColumn" placeholder="اختیاری — اگر آدرس صفحه‌ها را در شیت دارید"></td></tr>
-        <tr>
-          <td>یا فایل محلی</td>
-          <td><input id="file" dir="ltr" placeholder="products.csv یا products.xlsx — بدون حساب گوگل"></td>
-        </tr>
-      </table>
+      <table class="kv" id="basicFields"></table>
       <div class="row wrap">
-        <button id="saveSheetBtn" class="primary">ذخیره</button>
+        <button id="saveBtn" class="primary">ذخیره</button>
         <button id="inspectBtn">بررسی شیت (بدون نوشتن)</button>
+        <button id="tryBtn" class="ghost">آزمایش با ۲۰ ردیف</button>
         <span class="muted" id="inspectNote"></span>
       </div>
+      <details id="advanced">
+        <summary>تنظیمات پیشرفته</summary>
+        <table class="kv" id="advancedFields"></table>
+        <p class="muted">
+          بقیه‌ی رفتارها (سرعت، آستانه‌ی تطبیق، اندازه‌ی تصویر، طول خلاصه) خودکارند و
+          اگر لازم شد در <code>config.yaml</code> قابل تغییرند.
+        </p>
+      </details>
     </div>
 
     <div class="panel">
       <h2>۲. ستون‌های شیت شما</h2>
       <p class="muted">
-        فهرست ستون‌ها از خودِ شیت خوانده می‌شود — هر موضوعی (رمان، جزوه، نمونه سوال،
-        طرح توجیهی) شیت خودش را دارد. نوع هر ستون از نامش تشخیص داده می‌شود و
-        همان نام، برچسبی است که در جدول مشخصاتِ منابع دنبالش می‌گردیم.
+        نوع هر ستون از نامش تشخیص داده می‌شود و همان نام، برچسبی است که در جدول
+        مشخصاتِ منابع دنبالش می‌گردیم. کرکره‌ها از تبِ «لیست‌ها» می‌آیند.
       </p>
       <div class="scrollbox">
         <table class="grid" id="planTable">
@@ -89,98 +74,21 @@
           <tbody></tbody>
         </table>
       </div>
-      <p class="muted">
-        کرکره‌ها از تبِ «لیست‌ها» می‌آیند: هر ستون آن تب یک کرکره، با همان عنوانی که
-        در شیت محصولات دارد. اگر تشخیص نوعی غلط بود، در تب «تنظیمات فایل» زیر
-        <code>sheet.columns</code> تصحیحش کنید.
-      </p>
-    </div>
-  </section>
-
-  <!-- ---------------------------------------------------------- منابع -->
-  <section id="tab-sources" class="tab">
-    <div class="panel">
-      <h2>سایت‌های منبع</h2>
-      <p class="muted">
-        هر خط یک آدرس. برای هر عنوان، در همین سایت‌ها جستجو می‌شود و صفحه‌ای که
-        عنوانش بخورد خوانده می‌شود. <b>حداکثر یک درخواست در ثانیه به هر دامنه.</b>
-      </p>
-      <textarea id="sitesText" spellcheck="false" dir="ltr" placeholder="https://shop1.ir&#10;https://shop2.ir"></textarea>
-      <div class="row wrap">
-        <label><input id="searchEnabled" type="checkbox" checked> جستجو در سایت‌ها فعال باشد</label>
-        <span class="spacer"></span>
-        <button id="saveSitesBtn" class="primary">ذخیره‌ی سایت‌ها</button>
-      </div>
-      <p class="muted">
-        اگر سایتی وردپرسی نیست، قالب جستجویش را در تب «تنظیمات فایل» زیر
-        <code>sites</code> بنویسید (<code dir="ltr">search_url</code>).
-      </p>
     </div>
 
     <div class="panel">
-      <h2>نگاشت «عنوان → آدرس»</h2>
+      <h2>۳. آدرس منابع (اختیاری)</h2>
       <p class="muted">
-        اگر از جای دیگری آدرس صفحه‌ی محصول‌ها را دارید (خروجی هر ابزار دیگری با یک
-        ستون عنوان و یک ستون آدرس)، اینجا ایمپورتش کنید تا برنامه به‌جای جستجو
-        مستقیم سراغ همان صفحه‌ها برود — سریع‌تر و مؤدبانه‌تر.
+        اگر از جای دیگری لینک صفحه‌ی محصول‌ها را دارید، اینجا ایمپورت کنید تا
+        به‌جای جستجو مستقیم سراغ همان صفحه‌ها برود — سریع‌تر و مؤدبانه‌تر.
+        دامنه‌های همین لینک‌ها به‌عنوان سایت منبع هم استفاده می‌شوند.
       </p>
       <div class="row wrap">
         <input id="linksFile" dir="ltr" placeholder="C:\path\sources.csv">
         <button id="importLinksBtn">ایمپورت</button>
+        <button id="clearCacheBtn" class="ghost danger">خالی کردن کش صفحه‌ها</button>
         <span class="muted" id="linksNote"></span>
       </div>
-    </div>
-
-    <div class="panel">
-      <h2>کش صفحه‌ها</h2>
-      <p class="muted">
-        هر صفحه‌ی منبع یک‌بار دانلود و استخراج می‌شود و نتیجه‌اش می‌ماند. اگر منابع
-        محتوایشان را عوض کرده‌اند، کش را خالی کنید.
-      </p>
-      <div class="row">
-        <button id="clearCacheBtn" class="ghost danger">خالی کردن کش</button>
-        <span class="muted" id="cacheNote"></span>
-      </div>
-    </div>
-  </section>
-
-  <!-- ---------------------------------------------------------- قواعد -->
-  <section id="tab-rules" class="tab">
-    <div class="panel">
-      <h2>قواعد پر کردن</h2>
-      <table class="kv">
-        <tr>
-          <td>سلول‌های پرشده</td>
-          <td>
-            <select id="overwrite">
-              <option value="empty">دست نخورند — فقط سلول خالی پر شود</option>
-              <option value="always">بازنویسی شوند</option>
-            </select>
-          </td>
-        </tr>
-        <tr><td>سقف عنوان در هر اجرا</td><td><input id="maxTitles" type="number" min="0" value="0"></td></tr>
-        <tr><td>سقف صفحه‌ی دانلودی هر اجرا</td><td><input id="maxPages" type="number" min="0" value="0"></td></tr>
-        <tr><td>سقف کل (۰ = همه)</td><td><input id="limit" type="number" min="0" value="0"></td></tr>
-        <tr><td>حداکثر منبع برای هر عنوان</td><td><input id="maxSources" type="number" min="1" value="5"></td></tr>
-        <tr><td>هر چند ردیف یک‌بار در شیت نوشته شود</td><td><input id="batchRows" type="number" min="1" value="100"></td></tr>
-        <tr><td>حداکثر دسته / تگ</td><td><input id="maxCats" type="number" min="1" value="3"> <input id="maxTags" type="number" min="1" value="5"></td></tr>
-        <tr><td>جداکننده‌ی چندانتخابی</td><td><input id="separator" style="max-width:8rem" placeholder="، "></td></tr>
-        <tr><td>ردیف‌های ناقص</td><td><label><input id="retryPartial" type="checkbox"> در اجرای بعدی دوباره امتحان شوند</label></td></tr>
-        <tr>
-          <td>تصویر</td>
-          <td>
-            <label><input id="imageEnabled" type="checkbox" checked> جمع‌آوری لینک کاور مربع</label>
-            حداقل ضلع: <input id="imageMinSide" type="number" min="0" value="400">
-          </td>
-        </tr>
-      </table>
-      <div class="row">
-        <button id="saveRulesBtn" class="primary">ذخیره‌ی قواعد</button>
-      </div>
-      <p class="warn">
-        ستون‌های <b>وضعیت</b> و <b>شناسه محصول</b> هیچ‌وقت نوشته نمی‌شوند؛ آن‌ها را
-        اسکریپت درج محصول پر می‌کند.
-      </p>
     </div>
   </section>
 
@@ -190,16 +98,13 @@
       <div class="cards" id="counterCards"></div>
       <div class="row wrap">
         <button id="runBtn2" class="primary">اجرا</button>
-        <button id="cancelBtn2" class="danger" disabled>لغو</button>
+        <button id="cancelBtn2" class="danger" disabled>توقف</button>
         <button id="resetBtn" class="ghost danger">صف را از نو بساز</button>
         <span class="spacer"></span>
         <a id="dlCsv" class="ghost button-like">دانلود CSV</a>
         <a id="dlXlsx" class="ghost button-like">دانلود اکسل</a>
       </div>
-      <p class="muted">
-        اجرا از سر گرفتنی است: هر ردیف بلافاصله ذخیره می‌شود و صفحه‌های دانلودشده
-        کش می‌مانند، پس اجرای بعدی از همان‌جا ادامه می‌دهد.
-      </p>
+      <p class="muted" id="autoNote"></p>
     </div>
     <div class="panel">
       <h2>لاگ زنده</h2>
@@ -228,39 +133,9 @@
       </div>
       <p class="muted">
         «ناقص» یعنی برای بعضی ستون‌ها شاهدی پیدا نشد — دلیلش در ستون یادداشت و در
-        تبِ گزارشِ خودِ شیت نوشته شده است.
+        تبِ گزارشِ خودِ شیت نوشته شده است. ردیف‌های «بدون منبع» بعد از یک هفته
+        خودشان دوباره امتحان می‌شوند.
       </p>
-    </div>
-  </section>
-
-  <!-- -------------------------------------------------- تنظیمات فایل -->
-  <section id="tab-config" class="tab">
-    <div class="panel">
-      <h2>config.yaml</h2>
-      <div class="row">
-        <span class="muted" id="configPath"></span>
-        <span class="spacer"></span>
-        <button id="configReload" class="ghost">بازخوانی</button>
-        <button id="configSave" class="primary">ذخیره</button>
-      </div>
-      <p class="warn">
-        ذخیره، فایل را بازنویسی می‌کند و یک نسخه‌ی پشتیبان <code>.bak</code> می‌سازد.
-        چیزهایی که در تب‌های دیگر تنظیم می‌کنید در دیتابیس ذخیره می‌شوند و روی این
-        فایل سوارند.
-      </p>
-      <textarea id="configText" spellcheck="false" dir="ltr"></textarea>
-    </div>
-    <div class="panel">
-      <h2>آزمایش کلمه‌ی کلیدی</h2>
-      <p class="muted">
-        ببینید یک عنوان چه کلمه‌ی کلیدی‌ای می‌گیرد (کلمه‌های فروشگاهی و نام نویسنده
-        حذف می‌شوند).
-      </p>
-      <div class="row">
-        <input id="keywordInput" placeholder="دانلود پی دی اف رمان روز نود و سوم">
-        <button id="keywordBtn" class="primary">تحلیل</button>
-      </div>
-      <table class="kv" id="keywordOut"></table>
     </div>
   </section>
 </main>
