@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 venv/
 config.yaml
+
+# داده‌ها و خروجی‌های تکمیل‌کننده‌ی گوگل‌شیت
+sheet-filler/data/*.db
+sheet-filler/data/*.db-*
+sheet-filler/data/*.xlsx
+sheet-filler/data/*.csv

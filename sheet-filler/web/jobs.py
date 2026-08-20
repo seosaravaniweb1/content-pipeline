@@ -1,0 +1,240 @@
+"""اجرای کار تکمیل در پس‌زمینه برای پنل.
+
+قواعدی که اینجا رعایت شده و شکستنشان دردسر می‌سازد:
+
+* در هر لحظه فقط **یک** کار اجرا می‌شود؛ دو اجرای هم‌زمان روی یک شیت یعنی
+  دو برابر شدن نرخ درخواست به سایت‌های منبع و دو نویسنده روی یک سلول.
+* ترد کارگر اتصال sqlite خودش را باز می‌کند. اتصال sqlite بین تردها
+  قابل اشتراک نیست و WAL خواندن هم‌زمان را پوشش می‌دهد.
+* هر چیزی که فازها با ``print`` می‌نویسند به بافر لاگ همین کار می‌رود،
+  نه به ترمینال؛ مسیریابی بر اساس شناسه‌ی ترد است تا چاپ‌های بقیه‌ی
+  برنامه دست‌نخورده بماند.
+* لغو، تعاونی است: بین دو ردیف بررسی می‌شود. ردیفِ در حال پردازش تمام
+  می‌شود (چند ثانیه) تا داده‌ی نیم‌بند در شیت ننشیند.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, Callable, TextIO
+
+from ..core import db, filler, http
+from ..core.config import Config
+
+MAX_LINES = 4000
+
+IDLE = "idle"
+RUNNING = "running"
+DONE = "done"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+
+class JobBusy(RuntimeError):
+    """یک کار در حال اجراست."""
+
+
+class _StdoutRouter:
+    """جایگزین ``sys.stdout`` که نوشته‌ها را بر اساس ترد مسیریابی می‌کند."""
+
+    def __init__(self, original: TextIO) -> None:
+        self.original = original
+        self._sinks: dict[int, Callable[[str], None]] = {}
+
+    def register(self, sink: Callable[[str], None]) -> None:
+        self._sinks[threading.get_ident()] = sink
+
+    def unregister(self) -> None:
+        self._sinks.pop(threading.get_ident(), None)
+
+    def write(self, text: str) -> int:
+        sink = self._sinks.get(threading.get_ident())
+        if sink is None:
+            return self.original.write(text)
+        sink(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.original.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+def install_router() -> _StdoutRouter:
+    """``sys.stdout`` را با مسیریاب جایگزین می‌کند (اگر قبلاً نشده باشد).
+
+    این کار در لحظه‌ی شروع کار انجام می‌شود، نه در بالا آمدن سرور؛ چون
+    ممکن است چیز دیگری (مثلاً pytest) بعداً ``sys.stdout`` را عوض کرده باشد.
+    """
+    stream = sys.stdout
+    if isinstance(stream, _StdoutRouter):
+        return stream
+    router = _StdoutRouter(stream)
+    sys.stdout = router  # type: ignore[assignment]
+    return router
+
+
+@dataclass
+class JobState:
+    status: str = IDLE
+    #: شیتی که در حال پر شدن است (برای نمایش در پنل)
+    sheet: str = ""
+    error: str = ""
+    summary: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "sheet": self.sheet,
+            "error": self.error,
+            "summary": self.summary,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed": round((self.finished_at or time.time()) - self.started_at, 1)
+            if self.started_at
+            else 0.0,
+        }
+
+
+class JobRunner:
+    """یک کار در پس‌زمینه، با لاگ قابل خواندن به‌صورت افزایشی."""
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self._lock = threading.Lock()
+        self._state = JobState()
+        self._lines: list[str] = []
+        self._offset = 0  # تعداد خطوطی که از ابتدای کار دور ریخته شده‌اند
+        self._partial = ""
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ------------------------------------------------------------------ لاگ
+    def _emit(self, text: str) -> None:
+        with self._lock:
+            self._partial += text
+            while "\n" in self._partial:
+                line, self._partial = self._partial.split("\n", 1)
+                self._append(line.rstrip())
+
+    def _append(self, line: str) -> None:
+        self._lines.append(line)
+        if len(self._lines) > MAX_LINES:
+            drop = len(self._lines) - MAX_LINES
+            del self._lines[:drop]
+            self._offset += drop
+
+    def log(self, line: str) -> None:
+        with self._lock:
+            self._append(str(line).rstrip())
+
+    def tail(self, since: int = 0) -> tuple[int, list[str]]:
+        """خطوط از شماره‌ی ``since`` به بعد، همراه با شماره‌ی خط بعدی."""
+        with self._lock:
+            start = max(0, since - self._offset)
+            return self._offset + len(self._lines), list(self._lines[start:])
+
+    # ----------------------------------------------------------------- حالت
+    @property
+    def running(self) -> bool:
+        return self._state.status == RUNNING
+
+    def snapshot(self, since: int = 0) -> dict:
+        with self._lock:
+            state = self._state.as_dict()
+        next_line, lines = self.tail(since)
+        state["lines"] = lines
+        state["next"] = next_line
+        return state
+
+    # ------------------------------------------------------------------ کار
+    def start(self, options: Any, config: Config | None = None) -> None:
+        """شروع یک اجرای تکمیل در پس‌زمینه."""
+        with self._lock:
+            if self._state.status == RUNNING:
+                raise JobBusy("یک اجرا در جریان است؛ اول آن را تمام یا لغو کنید.")
+            if config is not None:
+                self.config = config
+            self._state = JobState(
+                status=RUNNING,
+                sheet=options.sheet.tab or options.sheet.file or options.sheet.sheet_id,
+                started_at=time.time(),
+            )
+            self._lines = []
+            self._offset = 0
+            self._partial = ""
+            self._cancel.clear()
+        self._thread = threading.Thread(
+            target=self._worker, args=(options,), name="sheet-filler-job", daemon=True
+        )
+        self._thread.start()
+
+    def cancel(self) -> bool:
+        """لغو — بین دو واحد کار (هر صفحه، هر کوئری) بررسی می‌شود.
+
+        ردیفِ در حال پردازش تمام می‌شود (چند ثانیه) ولی بعدش متوقف می‌شویم؛
+        نه اینکه تا آخر شیت ادامه بدهد.
+        """
+        if not self.running:
+            return False
+        self._cancel.set()
+        self.log("⏹ درخواست لغو ثبت شد؛ بعد از پایان کارِ در جریان متوقف می‌شود.")
+        return True
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _finish(self, status: str, error: str = "", summary: str = "") -> None:
+        with self._lock:
+            self._state.status = status
+            self._state.error = error
+            self._state.summary = summary
+            self._state.finished_at = time.time()
+
+    def _worker(self, options: Any) -> None:
+        router = install_router()
+        router.register(self._emit)
+        conn = None
+        try:
+            conn = db.connect(self.config.db_path)
+            with http.fetcher_from_config(self.config) as fetcher:
+                if fetcher.backend != "curl_cffi":
+                    self.log(
+                        "⚠ curl_cffi نصب نیست؛ بعضی سایت‌ها ممکن است پاسخ ندهند. "
+                        "نصب: pip install curl_cffi"
+                    )
+                stats = filler.run(
+                    conn,
+                    self.config,
+                    options,
+                    fetcher,
+                    log=self.log,
+                    should_stop=self._cancel.is_set,
+                )
+            summary = stats.render()
+            for line in summary.splitlines():
+                self.log(line)
+            if self._cancel.is_set():
+                self.log("⏹ اجرا لغو شد؛ آنچه تا اینجا پر شد در شیت و دیتابیس محفوظ است.")
+                self._finish(CANCELLED, summary=summary)
+            else:
+                self.log("✔ پایان.")
+                self._finish(DONE, summary=summary)
+        except Exception as exc:  # noqa: BLE001 — پیام خطا باید به پنل برسد
+            self.log(f"✖ خطا: {exc}")
+            for line in traceback.format_exc().splitlines()[-12:]:
+                self.log(line)
+            self.log("ردیف‌های پرشده در دیتابیس محفوظ‌اند؛ بعد از رفع مشکل دوباره اجرا کنید.")
+            self._finish(FAILED, str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+            router.unregister()
