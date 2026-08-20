@@ -192,27 +192,35 @@ _HEADER_LOOKUP = {
 
 
 def options_from_lists_tab(rows: Sequence[Sequence[str]]) -> dict[str, list[str]]:
-    """جدول تبِ «لیست‌ها» → ``{فیلد: [گزینه‌های مجاز]}``.
+    """جدول تبِ «لیست‌ها» → ``{عنوان ستون: [گزینه‌های مجاز]}``.
 
-    هر ستون یک کرکره است: سطر اول عنوان ستون و بقیه گزینه‌ها. ستونی که عنوانش
-    شناخته نشود نادیده گرفته می‌شود (کاربر ممکن است ستون‌های کمکی داشته باشد).
+    هر ستون یک کرکره است: سطر اول عنوان و بقیه گزینه‌ها. **هیچ ستونی نادیده
+    گرفته نمی‌شود**؛ حتی ستونی که کد اسمش را نشنیده («مناسب رشته»، «مقطع»)
+    هم گزینه‌هایش برداشته می‌شود، چون همان ستون در شیت محصولات کرکره دارد.
+
+    برای ستون‌های شناخته‌شده، کلید داخلی هم اضافه می‌شود (``categories``،
+    ``tags``، ...) تا کدی که با نام داخلی کار می‌کند هم جواب بگیرد.
     """
     if not rows:
         return {}
     header = list(rows[0])
-    columns: dict[int, str] = {}
+    out: dict[str, list[str]] = {}
     for index, cell in enumerate(header):
-        field_name = _HEADER_LOOKUP.get(label_key(str(cell)))
-        if field_name:
-            columns[index] = field_name
-
-    out: dict[str, list[str]] = {name: [] for name in columns.values()}
-    for row in rows[1:]:
-        for index, field_name in columns.items():
+        column = str(cell or "").strip()
+        if not column:
+            continue
+        values: list[str] = []
+        for row in rows[1:]:
             value = str(row[index]).strip() if index < len(row) else ""
-            if value and value not in out[field_name]:
-                out[field_name].append(value)
-    return {key: value for key, value in out.items() if value}
+            if value and value not in values:
+                values.append(value)
+        if not values:
+            continue
+        out[column] = values
+        alias = _HEADER_LOOKUP.get(label_key(column))
+        if alias and alias not in out:
+            out[alias] = values
+    return out
 
 
 _SPLIT = re.compile(r"[،,;|/]+")

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urlparse
 
-from ..core import db, normalizer, pipeline, presets
+from ..core import db, gsheet, normalizer, pipeline, presets, taxonomy
 from ..output import exporter
 from ..core.config import Config, ConfigError, load_config
 from ..phases import p5_details
@@ -675,9 +675,25 @@ def api_details(state: PanelState, query: dict) -> dict:
         "gspread": _gspread_available(),
         "counts": counts,
         "rows": rows,
-        "columns": list(p5_details.FILLABLE),
+        "plan": _detail_plan(conn, run_id),
+        "kinds": p5_details.KIND_LABELS,
         "never_write": list(options.sheet.never_write),
     }
+
+
+def _detail_plan(conn: sqlite3.Connection, run_id: str) -> list[dict]:
+    """ستون‌هایی که فاز ۵ در شیتِ همین اجرا دیده و نوعی که برایشان تشخیص داده.
+
+    این همان چیزی است که کاربر باید **قبل** از اجرا ببیند: اگر «تعداد سوالات»
+    را متن تشخیص داده یا ستونی جا افتاده، همین‌جا معلوم می‌شود نه بعد از
+    نوشتن ۱۵ هزار ردیف.
+    """
+    if not run_id:
+        return []
+    stored = db.get_setting(conn, f"detail_plan:{run_id}", None)
+    if not isinstance(stored, list):
+        return []
+    return [item for item in stored if isinstance(item, dict) and item.get("column")]
 
 
 def _detail_counts(conn: sqlite3.Connection, run_id: str) -> dict[str, int]:
@@ -704,7 +720,7 @@ def _detail_dict(row: sqlite3.Row) -> dict:
         "status": row["status"] or db.PENDING,
         "pushed": bool(row["pushed"]),
         "note": row["note"] or "",
-        "values": {name: (row[name] or "") for name in db.DETAIL_FIELDS},
+        "values": db.detail_values(row),
     }
 
 
@@ -712,6 +728,43 @@ def _gspread_available() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("gspread") is not None
+
+
+def api_detail_preview(state: PanelState, body: dict) -> dict:
+    """شیت را باز می‌کند و فقط می‌گوید چه ستون‌هایی دیده — بدون نوشتن چیزی.
+
+    دکمه‌ی «بررسی شیت» در پنل همین را صدا می‌زند؛ یک بار خواندن، هیچ نوشتنی.
+    """
+    _guard_idle(state)
+    settings = {**detail_settings(state), **{k: v for k, v in body.items() if k != "run_id"}}
+    options = p5_details.options_from_config(state.config, settings)
+    if not (options.sheet.sheet_id or options.sheet.file):
+        raise ApiError("اول شناسه‌ی شیت یا مسیر فایل را بدهید.")
+    try:
+        document = gsheet.open_document(options.sheet)
+        lists = taxonomy.options_from_lists_tab(document.read_tab(options.sheet.lists_tab))
+        grid = document.read_grid()
+        plan = gsheet.plan_from_grid(grid, options.sheet, lists)
+        rows = gsheet.rows_from_grid(grid, plan, options.sheet.header_row)
+    except gsheet.SheetError as exc:
+        raise ApiError(str(exc)) from None
+    writable = {spec.key for spec in options.writable(plan)}
+    return {
+        "rows": len(rows),
+        "lists": {key: len(value) for key, value in lists.items()},
+        "plan": [
+            {
+                "column": spec.column,
+                "key": spec.key,
+                "kind": spec.kind,
+                "kind_label": p5_details.KIND_LABELS.get(spec.kind, spec.kind),
+                "writable": spec.key in writable,
+                "options": len(spec.options),
+                "labels": list(spec.search_labels()),
+            }
+            for spec in plan.specs
+        ],
+    }
 
 
 def api_save_details(state: PanelState, body: dict) -> dict:
@@ -791,6 +844,7 @@ POST_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/plan": api_save_plan,
     "/api/sheets": api_save_sheets,
     "/api/details": api_save_details,
+    "/api/details/preview": api_detail_preview,
     "/api/details/reset": api_reset_details,
 }
 

@@ -121,6 +121,7 @@ def merge_pages(
     tolerance: int = 10,
     min_agreement: int = 2,
     accept_single: bool = True,
+    unit: str = "صفحه",
 ) -> Decision:
     """عددی که بیشترین منبع رویش توافق دارند.
 
@@ -152,8 +153,106 @@ def merge_pages(
     note = "" if agreement >= min_agreement else "تک‌منبعی — دستی چک شود"
     if len(clusters) > 1:
         spread = max(firsts) - min(firsts)
-        note = (note + f" | اختلاف منابع: {spread} صفحه").strip(" |")
+        note = (note + f" | اختلاف منابع: {spread} {unit}".rstrip()).strip(" |")
     return Decision(value=str(value), votes=agreement, sources=len(firsts), note=note)
+
+
+# ---------------------------------------------------------------------------
+# مقدارهای عمومی (هر ستونی، هر موضوعی)
+# ---------------------------------------------------------------------------
+
+
+def merge_numbers(
+    per_source: Sequence[Sequence[int]],
+    tolerance: int = 0,
+    min_agreement: int = 2,
+    accept_single: bool = True,
+) -> Decision:
+    """هر عددی، نه فقط تعداد صفحات: تعداد سوالات، سال چاپ، مدت زمان.
+
+    ``tolerance`` صفر یعنی عددها باید دقیقاً یکی باشند (تعداد سوالات یا کد،
+    اختلاف‌بردار نیستند) و مقدار مثبت یعنی اختلاف کم بین منابع طبیعی است
+    (تعداد صفحات، چون یکی دو صفحه تبلیغ داخل فایل گذاشته).
+    """
+    return merge_pages(
+        per_source,
+        tolerance=tolerance,
+        min_agreement=min_agreement,
+        accept_single=accept_single,
+        unit="",
+    )
+
+
+def merge_text(per_source: Sequence[Sequence[str]], max_chars: int = 120) -> Decision:
+    """مقدار متنی کوتاه با رأی‌گیری: کد رایانه، نام کتاب، ناشر.
+
+    رأی روی شکل نرمال‌شده شمرده می‌شود ولی چیزی که نوشته می‌شود شکل خام و
+    خواناست. در تساوی، مقدار کامل‌تر برنده است — همان قاعده‌ی نام اشخاص.
+    """
+    votes: Counter[str] = Counter()
+    display: dict[str, str] = {}
+    for values in per_source:
+        for value in dict.fromkeys(values):
+            text = str(value).strip()
+            if not text or len(text) > max_chars:
+                continue
+            key = label_key(text)
+            if not key:
+                continue
+            votes[key] += 1
+            if key not in display or _better_text(text, display[key]):
+                display[key] = text
+    if not votes:
+        return Decision()
+    best, count = max(votes.items(), key=lambda item: (item[1], len(display[item[0]])))
+    note = "" if count > 1 else "تک‌منبعی — دستی چک شود"
+    return Decision(value=display[best], votes=count, sources=len(per_source), note=note)
+
+
+def _better_text(candidate: str, current: str) -> bool:
+    """کدام شکلِ یک مقدار در شیت بنشیند.
+
+    «۱۲۳۴۵۶» و ``123456`` یک کدند و رأیشان با هم شمرده می‌شود، ولی چیزی که
+    نوشته می‌شود باید شکل لاتین باشد: کد رایانه و شناسه در سیستم‌های دیگر
+    کپی می‌شوند و رقم فارسی آنجا مقدار دیگری است. در بقیه‌ی موارد، مقدار
+    کامل‌تر برنده است.
+    """
+    digits_only = candidate.replace(" ", "").isdigit() or current.replace(" ", "").isdigit()
+    if digits_only and candidate.isascii() != current.isascii():
+        return candidate.isascii()
+    return len(candidate) > len(current)
+
+
+#: چیزهایی که در مقدار یک ستون بله‌وخیر، یعنی «دارد» / «ندارد»
+YES_WORDS = ("دارد", "بله", "آری", "هست", "موجود", "همراه", "yes", "true", "✓", "دارای")
+NO_WORDS = ("ندارد", "خیر", "نه", "نیست", "ناموجود", "بدون", "no", "false", "-")
+
+
+def merge_flag(
+    per_source: Sequence[Sequence[str]],
+    true_label: str = "دارد",
+    false_label: str = "ندارد",
+    extra_true: Sequence[str] = (),
+) -> Decision:
+    """ستون‌های «دارد/ندارد»: جزوه همراه، پاسخ تشریحی، فایل صوتی.
+
+    نبودِ شاهد با «ندارد» یکی نیست: اگر هیچ منبعی چیزی نگفته باشد سلول خالی
+    می‌ماند، چون «ندارد» یک ادعاست و ما شاهدی برایش نداریم.
+    """
+    yes = no = 0
+    for values in per_source:
+        text = label_key(" ".join(str(value) for value in values))
+        if not text:
+            continue
+        if any(label_key(word) in text for word in (*YES_WORDS, *extra_true)):
+            yes += 1
+        elif any(label_key(word) in text for word in NO_WORDS):
+            no += 1
+    if not yes and not no:
+        return Decision(note="هیچ منبعی درباره‌اش چیزی نگفت")
+    if yes >= no:
+        return Decision(value=true_label, votes=yes, sources=yes + no)
+    return Decision(value=false_label, votes=no, sources=yes + no)
 
 
 # ---------------------------------------------------------------------------

@@ -766,19 +766,50 @@ function renderDetailStatus(data) {
   if (data.settings.sheet_id && !data.gspread) notes.push("gspread نصب نیست: pip install gspread");
   $("#dStatus").textContent = notes.join(" — ") || "آماده‌ی اجرا";
 
+  // ستون‌های جدول پیش‌نمایش از نقشه‌ی همین شیت می‌آیند، نه فهرست ثابت
+  const plan = (data.plan || []).filter((item) => item.kind !== "skip" && item.kind !== "title");
+  $("#dTable thead tr").replaceChildren(
+    el("th", { textContent: "ردیف", style: "width:3rem" }),
+    el("th", { textContent: "عنوان" }),
+    ...plan.map((item) => el("th", { textContent: item.column })),
+    el("th", { textContent: "وضعیت", style: "width:6rem" }),
+  );
   $("#dTable tbody").replaceChildren(...(data.rows || []).map((row) => el("tr", {}, [
     el("td", { textContent: row.row_number || "—" }),
     el("td", { textContent: row.title }),
-    el("td", { textContent: row.values.keyword }),
-    el("td", { textContent: row.values.author }),
-    el("td", { textContent: row.values.pages }),
-    el("td", { textContent: row.values.categories }),
-    el("td", {}, [row.values.image
-      ? el("a", { href: row.values.image, target: "_blank", rel: "noreferrer", textContent: "کاور" })
-      : document.createTextNode("—")]),
+    ...plan.map((item) => {
+      const value = row.values[item.key] || "";
+      if (item.kind === "image" && value) {
+        return el("td", {}, [el("a", {
+          href: value, target: "_blank", rel: "noreferrer", textContent: "کاور",
+        })]);
+      }
+      return el("td", { textContent: value.length > 90 ? `${value.slice(0, 90)}…` : value });
+    }),
     el("td", { textContent: DETAIL_STATUS[row.status] || row.status, title: row.note || "" }),
   ])));
 }
+
+$("#dPreviewBtn").addEventListener("click", async () => {
+  $("#dPreviewNote").textContent = "در حال خواندن شیت…";
+  try {
+    const data = await api("/api/details/preview", { method: "POST", body: detailBody() });
+    const lists = Object.entries(data.lists || {})
+      .map(([name, count]) => `${name} (${count})`).join("، ");
+    $("#dPreviewNote").textContent =
+      `${data.rows} ردیف — ${data.plan.length} ستون` + (lists ? ` — لیست‌ها: ${lists}` : "");
+    $("#dPlanBox").hidden = false;
+    $("#dPlanTable tbody").replaceChildren(...data.plan.map((item) => el("tr", {}, [
+      el("td", { textContent: item.column }),
+      el("td", { textContent: item.writable ? item.kind_label : `${item.kind_label} (نوشته نمی‌شود)` }),
+      el("td", { textContent: item.options ? String(item.options) : "—" }),
+      el("td", { className: "muted", textContent: item.labels.join("، ") }),
+    ])));
+  } catch (error) {
+    $("#dPreviewNote").textContent = "";
+    toast(error.message, true);
+  }
+});
 
 function detailBody() {
   const body = { run_id: state.runId };

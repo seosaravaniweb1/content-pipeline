@@ -16,6 +16,7 @@ from content_pipeline.core import (
     consensus,
     db,
     details,
+    fields,
     gsheet,
     images,
     normalizer,
@@ -334,16 +335,22 @@ HEADER = [
 
 
 def test_sheet_columns_are_matched_by_their_persian_or_english_titles():
-    columns = gsheet.resolve_columns(HEADER)
-    assert columns.describe()["title"] == "A"
-    assert columns.describe()["keyword"] == "B"
-    assert columns.describe()["product_id"] == "M"
-    assert not columns.missing
+    plan = fields.build_plan(HEADER)
+    assert plan.columns["title"] == 0
+    assert plan.columns["keyword"] == 1
+    assert plan.columns["product_id"] == 12
+    assert plan.by_key("status").kind == fields.KIND_SKIP
 
 
-def test_a_manual_column_letter_is_accepted():
-    columns = gsheet.resolve_columns(["ستون یک", "ستون دو"], {"title": "A", "keyword": "B"})
-    assert columns.fields["title"] == 0 and columns.fields["keyword"] == 1
+def test_the_first_column_is_the_title_when_nothing_says_otherwise():
+    plan = fields.build_plan(["نام فایل", "کلمه کلیدی"])
+    assert plan.specs[0].kind == fields.KIND_TITLE
+    assert plan.title_key == plan.specs[0].key
+
+
+def test_the_title_column_can_be_named_explicitly():
+    plan = fields.build_plan(["کد", "عنوان محتوا"], title_column="عنوان محتوا")
+    assert plan.by_key(plan.title_key).column == "عنوان محتوا"
 
 
 def test_updates_become_the_fewest_possible_ranges():
@@ -368,7 +375,9 @@ def sheet_file(tmp_path, rows):
 def test_rows_without_a_title_are_skipped(tmp_path):
     path = sheet_file(tmp_path, [["رمان الف"], [""], ["رمان ب"]])
     settings = gsheet.SheetSettings.from_mapping({"file": str(path)})
-    _, rows = gsheet.FileDocument(path, settings).read()
+    document = gsheet.FileDocument(path, settings)
+    grid = document.read_grid()
+    rows = gsheet.rows_from_grid(grid, gsheet.plan_from_grid(grid, settings))
     assert [row.title for row in rows] == ["رمان الف", "رمان ب"]
     assert [row.number for row in rows] == [2, 4]  # شماره‌ی ردیف واقعی شیت
 
@@ -569,8 +578,10 @@ def test_panel_settings_override_the_config_file(env):
 
 def test_status_and_product_id_are_never_writable():
     options = p5_details.options_from_config(load_config(None), {})
-    assert "status" not in options.writable
-    assert "product_id" not in options.writable
+    keys = [spec.key for spec in options.writable(fields.build_plan(HEADER))]
+    assert "status" not in keys
+    assert "product_id" not in keys
+    assert "title" not in keys
 
 
 def test_values_left_unwritten_by_a_crashed_run_are_pushed_next_time(env, tmp_path):
@@ -592,3 +603,181 @@ def test_values_left_unwritten_by_a_crashed_run_are_pushed_next_time(env, tmp_pa
     assert document.values[1][2] == "آوا محمدی"
     assert document.values[1][9] == "398"
     assert not db.unpushed_detail_rows(conn, run_id)
+
+
+# ---------------------------------------------------------------------------
+# موضوع‌های دیگر: ستون‌ها از خودِ شیت می‌آیند، نه از کد
+# ---------------------------------------------------------------------------
+
+EXAM_HEADER = [
+    "عنوان",
+    "کلمه کلیدی",
+    "تعداد سوالات",
+    "کد رایانه",
+    "تعداد صفحه",
+    "جزوه همراه",
+    "دسته بندی",
+    "مناسب رشته",
+    "تصویر",
+    "وضعیت",
+    "Product ID",
+]
+
+EXAM_PAGE_A = """<html><body>
+<h1>نمونه سوالات فنی حرفه‌ای کمک حسابدار</h1>
+<table>
+  <tr><th>تعداد سوالات</th><td>۲۴۰</td></tr>
+  <tr><th>کد رایانه</th><td>۱۲۳۴۵۶</td></tr>
+  <tr><th>تعداد صفحه</th><td>۸۰</td></tr>
+  <tr><th>جزوه همراه</th><td>دارد</td></tr>
+</table>
+<a href="/product-tag/hesabdari/" rel="tag">حسابداری</a>
+<a href="/product-category/fani/">نمونه سوال فنی حرفه‌ای</a>
+</body></html>"""
+
+EXAM_PAGE_B = """<html><body>
+<h1>نمونه سوالات کمک حسابدار فنی حرفه‌ای</h1>
+<div><span>تعداد سوالات:</span> <span>۲۴۰</span></div>
+<div><span>کد رایانه:</span> <span>123456</span></div>
+<div><span>تعداد صفحه:</span> <span>۸۲</span></div>
+</body></html>"""
+
+EXAM_LISTS = [
+    ["دسته بندی", "مناسب رشته", "جزوه همراه"],
+    ["نمونه سوال فنی حرفه‌ای", "حسابداری", "دارد"],
+    ["نمونه سوال استخدامی", "کامپیوتر", "ندارد"],
+]
+
+
+def exam_sheet(tmp_path, rows):
+    path = tmp_path / "exam.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(EXAM_HEADER)
+        for row in rows:
+            writer.writerow(row + [""] * (len(EXAM_HEADER) - len(row)))
+    return path
+
+
+class ListsDocument(gsheet.FileDocument):
+    """فایل محلی + یک تبِ «لیست‌ها»ی ساختگی."""
+
+    def __init__(self, path, settings, lists):
+        super().__init__(path, settings)
+        self.lists = lists
+
+    def read_tab(self, title):
+        return self.lists if title else []
+
+
+def test_exam_sheet_columns_are_filled_although_no_code_knows_them(env, tmp_path):
+    """ستون «تعداد سوالات» و «کد رایانه» هیچ‌جای کد hardcode نشده‌اند."""
+    conn, run_id, config = env
+    title = "نمونه سوالات فنی حرفه‌ای کمک حسابدار"
+    with db.transaction(conn):
+        for domain, url in (("a.ir", "https://a.ir/p/1"), ("b.ir", "https://b.ir/p/2")):
+            db.insert_raw_product(
+                conn, run_id, domain, url, title, normalizer.normalize(title)
+            )
+    path = exam_sheet(tmp_path, [[title]])
+    options = p5_details.options_from_config(
+        config, {"file": str(path), "report_tab": "", "search": {"enabled": False}}
+    )
+    document = ListsDocument(path, options.sheet, EXAM_LISTS)
+    fetcher = FakeFetcher({"https://a.ir/p/1": EXAM_PAGE_A, "https://b.ir/p/2": EXAM_PAGE_B})
+
+    stats = p5_details.run(
+        conn, run_id, config, fetcher, options, document=document, verbose=False
+    )
+    assert stats.processed == 1 and stats.no_source == 0
+
+    stored = db.detail_values(db.detail_rows(conn, run_id)[0])
+    assert stored["questions"] == "240"       # هر دو منبع موافق‌اند
+    assert stored["computer_code"] == "123456"
+    assert stored["pages"] == "81"            # ۸۰ و ۸۲ → میانه‌ی خوشه
+    assert stored[details.label_key("جزوه همراه")] == "دارد"
+    assert stored["categories"] == "نمونه سوال فنی حرفه‌ای"
+    # ستون شناخته‌شده کلید داخلی خودش را دارد، ستون ناشناخته کلیدی از نام خودش
+    assert stored["fields_of_study"] == "حسابداری"
+    assert stored["keyword"] == "نمونه سوالات فنی حرفه‌ای کمک حسابدار"
+
+    # همان مقدارها در خودِ شیت، و ستون‌های وضعیت/شناسه دست‌نخورده
+    row = document.values[1]
+    assert row[2] == "240" and row[3] == "123456" and row[5] == "دارد"
+    assert row[9] == "" and row[10] == ""
+
+
+def test_a_dropdown_column_only_accepts_values_from_the_lists_tab(env, tmp_path):
+    conn, run_id, config = env
+    title = "نمونه سوالات فنی حرفه‌ای کمک حسابدار"
+    with db.transaction(conn):
+        db.insert_raw_product(
+            conn, run_id, "a.ir", "https://a.ir/p/1", title, normalizer.normalize(title)
+        )
+    path = exam_sheet(tmp_path, [[title]])
+    options = p5_details.options_from_config(
+        config, {"file": str(path), "report_tab": "", "search": {"enabled": False}}
+    )
+    # فهرست رشته‌ها «حسابداری» ندارد، پس نباید چیزی نوشته شود
+    lists = [["دسته بندی", "مناسب رشته"], ["نمونه سوال استخدامی", "برق"]]
+    document = ListsDocument(path, options.sheet, lists)
+    p5_details.run(
+        conn,
+        run_id,
+        config,
+        FakeFetcher({"https://a.ir/p/1": EXAM_PAGE_A}),
+        options,
+        document=document,
+        verbose=False,
+    )
+    stored = db.detail_values(db.detail_rows(conn, run_id)[0])
+    assert stored.get("fields_of_study", "") == ""
+    assert stored.get("categories", "") == ""
+
+
+def test_an_unknown_column_is_filled_from_its_own_label(env, tmp_path):
+    """ستونی که نه در کد است نه در config: عنوانش خودش برچسب جستجو می‌شود."""
+    conn, run_id, config = env
+    title = "طرح توجیهی پرورش قارچ"
+    with db.transaction(conn):
+        db.insert_raw_product(
+            conn, run_id, "a.ir", "https://a.ir/p/9", title, normalizer.normalize(title)
+        )
+    header = ["عنوان", "ظرفیت تولید", "میزان سرمایه گذاری"]
+    path = tmp_path / "tarh.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerow([title, "", ""])
+
+    page = """<html><body><h1>طرح توجیهی پرورش قارچ</h1><table>
+      <tr><th>ظرفیت تولید</th><td>۵۰ تن در سال</td></tr>
+      <tr><th>میزان سرمایه گذاری</th><td>۲ میلیارد ریال</td></tr>
+    </table></body></html>"""
+    options = p5_details.options_from_config(
+        config, {"file": str(path), "report_tab": "", "search": {"enabled": False}}
+    )
+    document = gsheet.FileDocument(path, options.sheet)
+    p5_details.run(
+        conn,
+        run_id,
+        config,
+        FakeFetcher({"https://a.ir/p/9": page}),
+        options,
+        document=document,
+        verbose=False,
+    )
+    assert document.values[1][1] == "۵۰ تن در سال"
+    assert document.values[1][2] == "۲ میلیارد ریال"
+
+
+def test_a_column_type_can_be_corrected_from_config(env, tmp_path):
+    """اگر حدس خودکار درست نبود، config حرف آخر را می‌زند."""
+    plan = fields.build_plan(
+        ["عنوان", "زمان آزمون"],
+        overrides={"زمان آزمون": {"kind": "number", "labels": ["مدت زمان آزمون"], "max_value": 500}},
+    )
+    spec = plan.specs[1]
+    assert spec.kind == fields.KIND_NUMBER
+    assert "مدت زمان آزمون" in spec.search_labels()
+    assert spec.max_value == 500

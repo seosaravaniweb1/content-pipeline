@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from . import extract
 from .normalizer import ZWNJ, latin_digits, normalize_display
@@ -204,6 +204,11 @@ class PageDetails:
     url: str = ""
     domain: str = ""
     title: str = ""
+    #: **همه‌ی** برچسب/مقدارهای این صفحه: ``کلید برچسب → [مقدارها]``.
+    #: این دیکشنری عمومی است و به موضوع خاصی گره نخورده — ستون «تعداد سوالات»
+    #: یا «کد رایانه» هم از همین‌جا درمی‌آید، بدون اینکه در کد اسمی از آن‌ها
+    #: برده شده باشد. فیلدهای زیر فقط شکل آماده‌ی پرکاربردترین برچسب‌هایند.
+    labeled: dict[str, list[str]] = field(default_factory=dict)
     authors: list[str] = field(default_factory=list)
     translators: list[str] = field(default_factory=list)
     #: همه‌ی عددهایی که این صفحه به‌عنوان تعداد صفحات داده (معمولاً یکی)
@@ -218,14 +223,38 @@ class PageDetails:
     publisher: str = ""
     images: list[ImageCandidate] = field(default_factory=list)
 
+    def values_for(self, labels: Sequence[str]) -> list[str]:
+        """مقدارهای این صفحه برای هر مجموعه برچسب («تعداد سوالات»، «تعداد سوال»، ...).
+
+        ورودی، برچسب‌های خام است نه کلید؛ نرمال‌سازی همین‌جا انجام می‌شود تا
+        صداکننده لازم نباشد چیزی درباره‌ی شکل کلیدها بداند.
+        """
+        out: list[str] = []
+        for label in labels:
+            for value in self.labeled.get(label_key(label), []):
+                if value not in out:
+                    out.append(value)
+        return out
+
     @property
     def pages(self) -> int | None:
         return self.page_counts[0] if self.page_counts else None
 
     @property
     def is_empty(self) -> bool:
+        """صفحه‌ای که هیچ چیز قابل استفاده‌ای ندارد.
+
+        ملاک، **برچسب‌های عمومی** است نه فیلدهای رمان: صفحه‌ی یک طرح توجیهی
+        نه نویسنده دارد نه خلاصه، ولی «ظرفیت تولید» و «سرمایه‌گذاری»اش همان
+        چیزی است که ستون‌های شیتِ آن موضوع می‌خواهند.
+        """
         return not (
-            self.authors or self.translators or self.page_counts or self.summaries or self.tags
+            self.labeled
+            or self.summaries
+            or self.tags
+            or self.categories
+            or self.images
+            or self.page_counts
         )
 
     # -- سریال‌سازی برای کش دیتابیس ----------------------------------------
@@ -268,7 +297,10 @@ def block_lines(page_html: str, limit: int = 4000) -> list[str]:
     body = _BLOCK_END.sub("\x00", body)
     out: list[str] = []
     for chunk in extract.strip_tags(body).split("\x00"):
-        text = chunk.strip(" \t:،-–—|")
+        # دونقطه عمداً حذف نمی‌شود: در قالب‌هایی که برچسب و مقدار در دو عنصر
+        # جدا هستند («<span>نویسنده:</span><span>آوا</span>») تنها نشانه‌ای
+        # است که می‌گوید این خط برچسب است نه مقدار.
+        text = chunk.strip(" \t،-–—|").lstrip(":")
         if text:
             out.append(text)
         if len(out) >= limit:
@@ -278,41 +310,99 @@ def block_lines(page_html: str, limit: int = 4000) -> list[str]:
 
 _SEPARATOR = re.compile(r"\s*[:：]\s*|\s+[-–—]\s+|\s*\|\s*")
 
+#: بلندترین چیزی که هنوز «برچسب» است، نه جمله
+MAX_LABEL_CHARS = 40
+MAX_LABEL_WORDS = 6
+#: بلندترین چیزی که هنوز «مقدار یک برچسب» است، نه پاراگراف
+MAX_VALUE_CHARS = 160
+#: سقف تعداد برچسب‌های یک صفحه (جلوی باد کردن کش را می‌گیرد)
+MAX_LABELS = 80
 
-def labeled_values(lines: Iterable[str]) -> dict[str, list[str]]:
-    """خطوط متنی → ``{نام فیلد: [مقدارها]}`` بر اساس :data:`LABELS`.
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.S | re.I)
+_DL_RE = re.compile(r"<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>", re.S | re.I)
 
-    دو شکل رایج پوشش داده می‌شود: «نویسنده: آوا» در یک خط، و «نویسنده» در یک
-    سلول با «آوا» در سلول بعدی.
+
+def collect_labels(page_html: str, lines: Sequence[str] | None = None) -> dict[str, list[str]]:
+    """**همه‌ی** برچسب/مقدارهای یک صفحه: ``{کلید برچسب: [مقدارها]}``.
+
+    اینجا هیچ فهرست ثابتی از فیلدها در کار نیست و همین نکته‌ی اصلی است: شیت
+    یک موضوع ستون «تعداد سوالات» دارد و شیت موضوع دیگر «مناسب رشته»؛ کد نباید
+    اسم هیچ‌کدام را بداند. هر چیزی که در صفحه شکلِ «برچسب → مقدار» داشته باشد
+    برداشته می‌شود و بعد هر ستون، برچسب‌های خودش را از این دیکشنری برمی‌دارد.
+
+    سه شکل رایج پوشش داده می‌شود:
+
+    * ردیف جدول مشخصات: ``<tr><th>تعداد سوالات</th><td>۶۰</td></tr>``
+    * فهرست تعریفی: ``<dt>کد رایانه</dt><dd>۱۲۳۴</dd>``
+    * خط متنی: ``کد رایانه: ۱۲۳۴`` و شکل دوتکه‌اش (``کد رایانه:`` و مقدار در
+      عنصر بعدی، که در قالب‌های وردپرسی خیلی دیده می‌شود)
     """
-    rows = list(lines)
     found: dict[str, list[str]] = {}
 
-    def remember(field_name: str, value: str) -> None:
-        value = value.strip(" \t:،-–—|")
-        if value:
-            found.setdefault(field_name, []).append(value)
+    def remember(label: str, value: str) -> None:
+        label = (label or "").strip(" \t:،-–—|")
+        value = (value or "").strip(" \t:،-–—|")
+        key = label_key(label)
+        if not key or not value or len(found) >= MAX_LABELS:
+            return
+        if len(label) > MAX_LABEL_CHARS or len(label.split()) > MAX_LABEL_WORDS:
+            return
+        if len(value) > MAX_VALUE_CHARS:
+            value = value[:MAX_VALUE_CHARS].rstrip()
+        bucket = found.setdefault(key, [])
+        if value not in bucket and len(bucket) < 5:
+            bucket.append(value)
 
+    for row in _ROW_RE.findall(page_html or ""):
+        cells = [extract.strip_tags(cell) for cell in _CELL_RE.findall(row)]
+        cells = [cell for cell in cells if cell]
+        if len(cells) >= 2:
+            remember(cells[0], " ".join(cells[1:]))
+
+    for label, value in _DL_RE.findall(page_html or ""):
+        remember(extract.strip_tags(label), extract.strip_tags(value))
+
+    rows = list(lines if lines is not None else block_lines(page_html))
     for index, line in enumerate(rows):
-        if len(line) > 120:  # جمله‌ی متن، نه سلول جدول
+        if len(line) > MAX_LABEL_CHARS + MAX_VALUE_CHARS:
+            continue  # جمله‌ی متن، نه سلول مشخصات
+        head, separator, tail = _partition(line)
+        if not separator:
             continue
-        head, _, tail = _partition(line)
-        key = label_key(head)
-        if not key:
+        if tail.strip():
+            remember(head, tail)
             continue
-        for field_name, aliases in LABELS.items():
-            if key not in aliases:
-                continue
-            if tail.strip():
-                remember(field_name, tail)
-            else:
-                # مقدار در سلول/خط بعدی است
-                for candidate in rows[index + 1 : index + 3]:
-                    if candidate.strip() and label_key(_partition(candidate)[0]) not in _ALL_KEYS:
-                        remember(field_name, candidate)
-                        break
-            break
+        # «نویسنده:» در یک عنصر و مقدارش در عنصر بعدی
+        for candidate in rows[index + 1 : index + 2]:
+            if candidate.strip() and not _partition(candidate)[1]:
+                remember(head, candidate)
     return found
+
+
+def values_for(labeled: dict[str, list[str]], labels: Iterable[str]) -> list[str]:
+    """مقدارهای همه‌ی هم‌معنی‌های یک برچسب، بدون تکرار."""
+    out: list[str] = []
+    for label in labels:
+        for value in labeled.get(label_key(label), []):
+            if value not in out:
+                out.append(value)
+    return out
+
+
+def labeled_values(lines: Iterable[str]) -> dict[str, list[str]]:
+    """شکل قدیمی: ``{نام فیلد: [مقدارها]}`` بر اساس :data:`LABELS`.
+
+    روی همان استخراج عمومی سوار است و فقط برچسب‌های شناخته‌شده‌ی رمان/کتاب را
+    جدا می‌کند؛ برای کدی که فیلدهای آماده می‌خواهد.
+    """
+    labeled = collect_labels("", list(lines))
+    out: dict[str, list[str]] = {}
+    for field_name, aliases in LABELS.items():
+        values = [value for key in aliases for value in labeled.get(key, [])]
+        if values:
+            out[field_name] = list(dict.fromkeys(values))
+    return out
 
 
 def _partition(line: str) -> tuple[str, str, str]:
@@ -320,9 +410,6 @@ def _partition(line: str) -> tuple[str, str, str]:
     if match is None:
         return line, "", ""
     return line[: match.start()], match.group(0), line[match.end() :]
-
-
-_ALL_KEYS = frozenset(key for aliases in LABELS.values() for key in aliases)
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +781,12 @@ def extract_details(
         return details
 
     lines = block_lines(page_html)
-    labeled = labeled_values(lines)
+    # همه‌ی برچسب‌های صفحه ذخیره می‌شوند (هر ستونی از هر شیتی بعداً از همین
+    # دیکشنری مقدارش را برمی‌دارد)، و بعد فیلدهای آماده از رویشان ساخته می‌شوند.
+    details.labeled = collect_labels(page_html, lines)
+    labeled = {
+        name: values_for(details.labeled, aliases) for name, aliases in LABELS.items()
+    }
     blocks = extract.json_ld_blocks(page_html)
 
     # -- اشخاص --------------------------------------------------------------

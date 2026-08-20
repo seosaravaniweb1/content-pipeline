@@ -23,27 +23,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import fields
 from .details import label_key
 
-#: نام فیلدهای داخلی → عنوان‌های محتملِ ستون در شیت شما
-DEFAULT_COLUMNS: dict[str, tuple[str, ...]] = {
-    "title": ("عنوان", "عنوان محتوا", "title", "نام محصول", "عنوان محصول"),
-    "keyword": ("keyword", "کلمه کلیدی", "کیورد", "کلمه کلیدی اصلی"),
-    "author": ("author", "نویسنده", "نام نویسنده"),
-    "summary": ("summary", "خلاصه", "خلاصه رمان", "توضیحات"),
-    "categories": ("categories", "category", "دسته", "دسته بندی", "کتگوری"),
-    "tags": ("tags", "tag", "تگ", "برچسب"),
-    "nationality": ("nationality", "ملیت"),
-    "book_format": ("format", "فرمت", "قالب"),
-    "translator": ("translator", "مترجم"),
-    "pages": ("pages", "page", "تعداد صفحات", "صفحات"),
-    "image": ("image", "تصویر", "عکس", "لینک تصویر"),
-    "status": ("status", "وضعیت", "استاتوس"),
-    "product_id": ("product id", "product_id", "شناسه محصول", "آیدی محصول"),
-}
+#: کلیدی که مقدار ستون عنوان همیشه زیرش هم گذاشته می‌شود
+TITLE_KEY = "title"
 
-#: ستون‌هایی که فاز ۵ حق نوشتن در آن‌ها را ندارد
-DEFAULT_NEVER_WRITE: tuple[str, ...] = ("title", "status", "product_id")
+#: ستون‌هایی که فاز ۵ حق نوشتن در آن‌ها را ندارد (با نام داخلی یا عنوان ستون)
+DEFAULT_NEVER_WRITE: tuple[str, ...] = ("title", "status", "product_id", "وضعیت", "شناسه محصول")
 
 
 class SheetError(RuntimeError):
@@ -77,58 +64,6 @@ def column_index(letter: str) -> int:
     return value - 1
 
 
-@dataclass
-class ColumnMap:
-    """کدام فیلد در کدام ستون شیت است."""
-
-    header: list[str] = field(default_factory=list)
-    fields: dict[str, int] = field(default_factory=dict)
-    missing: list[str] = field(default_factory=list)
-
-    def index(self, field_name: str) -> int | None:
-        return self.fields.get(field_name)
-
-    def describe(self) -> dict[str, str]:
-        return {name: column_letter(index) for name, index in sorted(self.fields.items())}
-
-
-def resolve_columns(header: Sequence[str], mapping: dict[str, str] | None = None) -> ColumnMap:
-    """سطر عنوان شیت + نگاشت دستی → ``ColumnMap``.
-
-    نگاشت دستی هم عنوان ستون را می‌پذیرد («Product ID») و هم حرف ستون
-    («M»)؛ اولی امن‌تر است چون با جابه‌جا شدن ستون‌ها هم درست می‌ماند.
-    """
-    mapping = {key: str(value) for key, value in (mapping or {}).items() if str(value).strip()}
-    lookup: dict[str, int] = {}
-    for index, cell in enumerate(header):
-        key = label_key(str(cell))
-        if key and key not in lookup:
-            lookup[key] = index
-
-    resolved: dict[str, int] = {}
-    missing: list[str] = []
-    for name, aliases in DEFAULT_COLUMNS.items():
-        manual = mapping.get(name)
-        if manual:
-            key = label_key(manual)
-            if key in lookup:
-                resolved[name] = lookup[key]
-                continue
-            if len(manual) <= 2 and manual.isalpha():
-                resolved[name] = column_index(manual)
-                continue
-            missing.append(name)
-            continue
-        for alias in aliases:
-            key = label_key(alias)
-            if key in lookup:
-                resolved[name] = lookup[key]
-                break
-        else:
-            missing.append(name)
-    return ColumnMap(header=list(header), fields=resolved, missing=missing)
-
-
 # ---------------------------------------------------------------------------
 # ردیف‌ها و به‌روزرسانی‌ها
 # ---------------------------------------------------------------------------
@@ -143,7 +78,7 @@ class SheetRow:
 
     @property
     def title(self) -> str:
-        return (self.values.get("title") or "").strip()
+        return (self.values.get(TITLE_KEY) or "").strip()
 
     def empty_fields(self, names: Iterable[str]) -> list[str]:
         return [name for name in names if not (self.values.get(name) or "").strip()]
@@ -205,7 +140,10 @@ class SheetSettings:
     report_tab: str = "گزارش تکمیل"
     header_row: int = 1
     file: str = ""
-    columns: dict[str, str] = field(default_factory=dict)
+    #: عنوان ستون عنوان؛ خالی = ستون اول شیت
+    title_column: str = ""
+    #: تنظیم دستی ستون‌ها: ``{عنوان ستون: {kind، labels، options، ...}}``
+    columns: dict[str, Any] = field(default_factory=dict)
     never_write: tuple[str, ...] = DEFAULT_NEVER_WRITE
     batch_ranges: int = 400
     value_input_option: str = "RAW"
@@ -222,7 +160,8 @@ class SheetSettings:
             report_tab=str(data.get("report_tab", "گزارش تکمیل") or ""),
             header_row=max(1, int(data.get("header_row", 1) or 1)),
             file=str(data.get("file", "") or ""),
-            columns={k: str(v) for k, v in (data.get("columns") or {}).items()},
+            title_column=str(data.get("title_column", "") or ""),
+            columns=dict(data.get("columns") or {}),
             never_write=tuple(never) if never else DEFAULT_NEVER_WRITE,
             batch_ranges=max(1, int(data.get("batch_ranges", 400) or 400)),
             value_input_option=str(data.get("value_input_option", "RAW") or "RAW"),
@@ -234,7 +173,8 @@ class Document:
 
     name = ""
 
-    def read(self) -> tuple[ColumnMap, list[SheetRow]]:  # pragma: no cover - انتزاعی
+    def read_grid(self) -> list[list[str]]:  # pragma: no cover - انتزاعی
+        """کل شیت به‌صورت خام. تفسیر ستون‌ها کار :mod:`core.fields` است."""
         raise NotImplementedError
 
     def read_tab(self, title: str) -> list[list[str]]:  # pragma: no cover - انتزاعی
@@ -309,10 +249,9 @@ class GoogleSheetDocument(Document):
         return self._worksheet
 
     # -- خواندن -------------------------------------------------------------
-    def read(self) -> tuple[ColumnMap, list[SheetRow]]:  # pragma: no cover - نیازمند شبکه
+    def read_grid(self) -> list[list[str]]:  # pragma: no cover - نیازمند شبکه
         worksheet = self._open()
-        values = worksheet.get_all_values()
-        return _rows_from_values(values, self.settings)
+        return [list(row) for row in worksheet.get_all_values()]
 
     def read_tab(self, title: str) -> list[list[str]]:  # pragma: no cover - نیازمند شبکه
         if not title:
@@ -382,14 +321,14 @@ class FileDocument(Document):
         self.output_path = self.path.with_name(f"{self.path.stem}-filled.xlsx")
         self.written_cells = 0
 
-    def read(self) -> tuple[ColumnMap, list[SheetRow]]:
+    def read_grid(self) -> list[list[str]]:
         if not self.path.exists():
             raise SheetError(f"فایل ورودی پیدا نشد: {self.path}")
         if self.path.suffix.lower() in {".xlsx", ".xlsm"}:
             self.values = _read_xlsx(self.path)
         else:
             self.values = _read_csv(self.path)
-        return _rows_from_values(self.values, self.settings)
+        return self.values
 
     def apply(self, updates: Sequence[CellUpdate]) -> int:
         for update in updates:
@@ -456,31 +395,53 @@ def _read_xlsx(path: Path) -> list[list[str]]:
     return rows
 
 
-def _rows_from_values(
-    values: Sequence[Sequence[str]], settings: SheetSettings
-) -> tuple[ColumnMap, list[SheetRow]]:
-    if not values:
+def plan_from_grid(
+    grid: Sequence[Sequence[str]],
+    settings: SheetSettings,
+    lists: dict[str, list[str]] | None = None,
+) -> fields.FieldPlan:
+    """سطر عنوانِ شیت → نقشه‌ی ستون‌ها.
+
+    این تنها جایی است که تصمیم گرفته می‌شود «این شیت چه ستون‌هایی دارد»، و
+    تصمیمش از خودِ شیت می‌آید نه از کد: عنوان هر ستون، هم برچسب جستجو در
+    منابع می‌شود و هم نوع فیلد را تعیین می‌کند.
+    """
+    if not grid:
         raise SheetError("شیت خالی است.")
-    header_index = min(settings.header_row, len(values)) - 1
-    columns = resolve_columns(values[header_index], settings.columns)
-    if "title" not in columns.fields:
+    header_index = min(settings.header_row, len(grid)) - 1
+    plan = fields.build_plan(
+        grid[header_index],
+        lists=lists or {},
+        overrides=settings.columns,
+        title_column=settings.title_column,
+    )
+    if not plan.specs:
         raise SheetError(
-            "ستون عنوان پیدا نشد. یا عنوان ستون را به یکی از این‌ها تغییر بدهید "
-            f"({'، '.join(DEFAULT_COLUMNS['title'])}) یا در config کلید "
-            "details.columns.title را با نام/حرف همان ستون پر کنید.\n"
-            f"عنوان ستون‌های فعلی: {'، '.join(str(c) for c in values[header_index] if str(c).strip())}"
+            f"سطر {settings.header_row} شیت عنوان ستون ندارد."
+            " اگر عنوان‌ها در سطر دیگری‌اند، details.header_row را عوض کنید."
         )
+    return plan
+
+
+def rows_from_grid(
+    grid: Sequence[Sequence[str]], plan: fields.FieldPlan, header_row: int = 1
+) -> list[SheetRow]:
+    """ردیف‌های شیت با مقدار هر ستونِ نقشه‌شده."""
+    header_index = min(header_row, len(grid)) - 1
+    title_key = plan.title_key
     rows: list[SheetRow] = []
-    for offset, raw in enumerate(values[header_index + 1 :], start=header_index + 2):
+    for offset, raw in enumerate(grid[header_index + 1 :], start=header_index + 2):
         cells = list(raw)
-        row_values = {
-            name: (cells[index].strip() if index < len(cells) and cells[index] else "")
-            for name, index in columns.fields.items()
+        values = {
+            key: (cells[index].strip() if index < len(cells) and cells[index] else "")
+            for key, index in plan.columns.items()
         }
-        if not (row_values.get("title") or "").strip():
+        if title_key:
+            values[TITLE_KEY] = values.get(title_key, "")
+        if not (values.get(TITLE_KEY) or "").strip():
             continue  # ردیف خالی وسط شیت، پایان کار نیست
-        rows.append(SheetRow(number=offset, values=row_values))
-    return columns, rows
+        rows.append(SheetRow(number=offset, values=values))
+    return rows
 
 
 def _cell(value: Any) -> Any:

@@ -250,9 +250,32 @@
         </tr>
       </table>
       <p class="muted">
-        گزینه‌های کرکره‌ای (دسته و تگ و ملیت) از تبِ «لیست‌ها» خوانده می‌شوند: هر ستون
-        یک کرکره، سطر اولش عنوان ستون. این‌طوری هیچ‌وقت مقداری خارج از کرکره‌ی شما
-        در سلول نوشته نمی‌شود.
+        گزینه‌های کرکره‌ای از تبِ «لیست‌ها» خوانده می‌شوند: هر ستون یک کرکره، سطر
+        اولش دقیقاً همان عنوانی که در شیت محصولات دارد. این‌طوری هیچ‌وقت مقداری
+        خارج از کرکره‌ی شما در سلول نوشته نمی‌شود.
+      </p>
+      <div class="row wrap">
+        <button id="dPreviewBtn" class="ghost">بررسی شیت (بدون نوشتن)</button>
+        <span class="muted" id="dPreviewNote"></span>
+      </div>
+      <div class="scrollbox" id="dPlanBox" hidden>
+        <table class="grid" id="dPlanTable">
+          <thead>
+            <tr>
+              <th>ستون شیت</th>
+              <th style="width:9rem">چطور پر می‌شود</th>
+              <th style="width:5rem">گزینه‌ها</th>
+              <th>برچسب‌هایی که در منابع دنبالشان می‌گردیم</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted">
+        ستون‌ها از خودِ شیت خوانده می‌شوند: هر موضوعی (رمان، جزوه، نمونه سوال،
+        طرح توجیهی) ستون‌های خودش را دارد و نوع هر ستون از نامش تشخیص داده
+        می‌شود. اگر تشخیص درست نبود، در تب «تنظیمات» زیر <code>details.columns</code>
+        نوعش را دستی بگویید.
       </p>
     </div>
 
@@ -300,18 +323,7 @@
       <div class="cards" id="dCounters"></div>
       <div class="scrollbox">
         <table class="grid" id="dTable">
-          <thead>
-            <tr>
-              <th style="width:3rem">ردیف</th>
-              <th>عنوان</th>
-              <th style="width:10rem">کلمه کلیدی</th>
-              <th style="width:8rem">نویسنده</th>
-              <th style="width:4rem">صفحات</th>
-              <th style="width:9rem">دسته</th>
-              <th style="width:5rem">تصویر</th>
-              <th style="width:6rem">وضعیت</th>
-            </tr>
-          </thead>
+          <thead><tr></tr></thead>
           <tbody></tbody>
         </table>
       </div>

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 RUNNING = "running"
 COMPLETED = "completed"
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS detail_rows (
     translator  TEXT,
     pages       TEXT,
     image       TEXT,
+    field_values TEXT,     -- JSON: مقدار همه‌ی ستون‌های شیت (هر موضوعی، هر ستونی)
     sources     TEXT,      -- JSON: آدرس منابعی که این ردیف از آن‌ها ساخته شد
     evidence    TEXT,      -- JSON: برای هر ستون، دلیل و شماره‌ی منابع موافق
     status      TEXT,      -- pending | done | partial | failed
@@ -148,6 +149,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 NEW_COLUMNS: dict[str, dict[str, str]] = {
     "runs": {"categories": "TEXT", "sites": "TEXT", "options": "TEXT"},
+    "detail_rows": {"field_values": "TEXT"},
     "raw_products": {"category": "TEXT"},
     "lsi_keywords": {"source_query": "TEXT"},
 }
@@ -749,15 +751,33 @@ def save_detail_values(
 ) -> None:
     """نوشتن مقادیر استخراج‌شده‌ی یک ردیف.
 
+    مقدار **همه‌ی** ستون‌ها در ``field_values`` (JSON) می‌نشیند — چون هر
+    موضوعی ستون‌های خودش را دارد و ستون ثابتِ دیتابیس جوابگو نیست. ستون‌های
+    پرکاربرد جدا هم نگه داشته می‌شوند تا گزارش و پنل بدون پارس JSON کار کنند.
+
     فقط ستون‌هایی که مقدار دارند نوشته می‌شوند؛ ستون خالی، مقدار قبلی را
     پاک نمی‌کند تا اجرای دوباره‌ی فاز، کارِ اجرای قبلی را خراب نکند.
     """
-    sets = ["status=?", "note=?", "sources=?", "evidence=?", "pushed=0", "updated_at=?"]
+    stored = dict(detail_values(get_detail_row(conn, detail_id)))
+    for key, value in (values or {}).items():
+        if value not in (None, ""):
+            stored[str(key)] = str(value)
+
+    sets = [
+        "status=?",
+        "note=?",
+        "sources=?",
+        "evidence=?",
+        "field_values=?",
+        "pushed=0",
+        "updated_at=?",
+    ]
     params: list[Any] = [
         status,
         note,
         json.dumps(list(sources), ensure_ascii=False),
         json.dumps(evidence or {}, ensure_ascii=False),
+        json.dumps(stored, ensure_ascii=False),
         utcnow(),
     ]
     for field_name in DETAIL_FIELDS:
@@ -768,6 +788,30 @@ def save_detail_values(
         params.append(str(value))
     params.append(detail_id)
     conn.execute(f"UPDATE detail_rows SET {', '.join(sets)} WHERE id=?", params)
+
+
+def get_detail_row(conn: sqlite3.Connection, detail_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM detail_rows WHERE id=?", (detail_id,)).fetchone()
+
+
+def detail_values(row: sqlite3.Row | None) -> dict[str, str]:
+    """مقدار همه‌ی ستون‌های یک ردیف: JSON عمومی + ستون‌های پرکاربرد."""
+    if row is None:
+        return {}
+    out: dict[str, str] = {}
+    raw = row["field_values"] if "field_values" in row.keys() else None
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                out.update({str(k): str(v) for k, v in data.items() if v not in (None, "")})
+        except (TypeError, ValueError):
+            pass
+    for field_name in DETAIL_FIELDS:
+        value = row[field_name] if field_name in row.keys() else None
+        if value and field_name not in out:
+            out[field_name] = str(value)
+    return out
 
 
 def mark_detail_pushed(conn: sqlite3.Connection, detail_ids: Sequence[int]) -> None:

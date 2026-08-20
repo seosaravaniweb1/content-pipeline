@@ -1,8 +1,12 @@
 """فاز ۵ — تکمیل ستون‌های گوگل‌شیت محصولات.
 
 ورودی: فهرست عنوان‌های شما (ستون اول شیت، یا خروجی فازهای قبلی).
-خروجی: همان شیت، با ستون‌های کلمه‌ی کلیدی، نویسنده، خلاصه، دسته، تگ، ملیت،
-فرمت، مترجم، تعداد صفحات و تصویر — پرشده و قابل تحویل به اسکریپت درج محصول.
+خروجی: همان شیت، با ستون‌هایش پرشده و آماده‌ی تحویل به اسکریپت درج محصول.
+
+**کدام ستون‌ها؟ هرکدام که در شیت باشند.** این فاز فهرست ثابتی از فیلدها ندارد:
+شیت رمان «خلاصه» و «مترجم» دارد، شیت نمونه‌سوال «تعداد سوالات» و «کد رایانه»،
+شیت طرح توجیهی چیز دیگر. عنوان هر ستون هم برچسبِ جستجو در منابع است و هم
+نوع فیلد را تعیین می‌کند (:mod:`core.fields`).
 
 مسیر کار برای هر عنوان::
 
@@ -36,6 +40,7 @@ from ..core import (
     db,
     details,
     extract,
+    fields,
     gsheet,
     images,
     normalizer,
@@ -47,21 +52,6 @@ from ..core.details import PageDetails
 from ..core.http import Fetcher
 
 LogFn = Callable[[str], None]
-
-#: ستون‌هایی که این فاز پر می‌کند (به ترتیب خودِ شیت)
-FILLABLE = (
-    "keyword",
-    "author",
-    "summary",
-    "categories",
-    "tags",
-    "nationality",
-    "book_format",
-    "translator",
-    "pages",
-    "image",
-)
-
 
 # ---------------------------------------------------------------------------
 # تنظیمات
@@ -100,11 +90,25 @@ class DetailOptions:
     taxonomy: dict = field(default_factory=dict)
     combine_author_scripts: bool = True
 
-    @property
-    def writable(self) -> tuple[str, ...]:
-        never = set(self.sheet.never_write)
-        return tuple(name for name in FILLABLE if name not in never)
+    def writable(self, plan: fields.FieldPlan) -> list[fields.FieldSpec]:
+        """ستون‌های قابل نوشتنِ همین شیت (نه یک فهرست ثابت در کد)."""
+        return plan.writable(self.sheet.never_write)
 
+
+#: نام فارسی نوع ستون‌ها — فقط برای لاگ و پنل
+KIND_LABELS = {
+    fields.KIND_TITLE: "عنوان",
+    fields.KIND_KEYWORD: "کلمه کلیدی",
+    fields.KIND_PERSON: "شخص",
+    fields.KIND_NUMBER: "عدد",
+    fields.KIND_TEXT: "متن",
+    fields.KIND_SUMMARY: "خلاصه",
+    fields.KIND_CHOICE: "کرکره",
+    fields.KIND_MULTI: "کرکره چندتایی",
+    fields.KIND_BOOL: "دارد/ندارد",
+    fields.KIND_IMAGE: "تصویر",
+    fields.KIND_SKIP: "دست نمی‌خورد",
+}
 
 DEFAULT_LABELS = {
     "iranian": "ایرانی",
@@ -189,20 +193,9 @@ class DetailStats:
             f"ناقص: {self.partial}، بدون منبع: {self.no_source}"
         ]
         if self.filled:
-            names = {
-                "keyword": "کلمه کلیدی",
-                "author": "نویسنده",
-                "summary": "خلاصه",
-                "categories": "دسته",
-                "tags": "تگ",
-                "nationality": "ملیت",
-                "book_format": "فرمت",
-                "translator": "مترجم",
-                "pages": "صفحات",
-                "image": "تصویر",
-            }
+            # کلیدها همان عنوان ستون‌های شیت خودتان‌اند
             filled = "، ".join(
-                f"{names.get(key, key)}: {value}" for key, value in self.filled.items() if value
+                f"{key}: {value}" for key, value in self.filled.items() if value
             )
             parts.append(f"  ستون‌های پرشده — {filled}")
         parts.append(
@@ -335,128 +328,287 @@ def _snap(value: str, allowed: Sequence[str]) -> str:
     return value
 
 
-@dataclass
-class Vocabularies:
-    categories: taxonomy.Vocabulary
-    tags: taxonomy.Vocabulary
-    nationality: list[str] = field(default_factory=list)
-    book_format: list[str] = field(default_factory=list)
+#: واژگان پیش‌فرض برای ستون‌های شناخته‌شده (اگر تبِ «لیست‌ها» چیزی نداشت)
+DEFAULT_VOCABULARIES = {
+    "categories": taxonomy.DEFAULT_CATEGORIES,
+    "tags": taxonomy.DEFAULT_TAGS,
+}
 
 
-def build_vocabularies(options: DetailOptions, lists: dict[str, list[str]]) -> Vocabularies:
+def vocabulary_for(spec: fields.FieldSpec, options: DetailOptions) -> taxonomy.Vocabulary:
+    """واژگان یک ستون کرکره‌ای.
+
+    گزینه‌ها از تبِ «لیست‌ها»ی خود شیت می‌آیند (در ``spec.options`` نشسته‌اند).
+    فهرست پیش‌فرض فقط برای ستون‌های شناخته‌شده و وقتی کاربر لیستی نداده است.
+    """
     configured = options.taxonomy or {}
-    return Vocabularies(
-        categories=taxonomy.build(
-            "categories",
-            options=lists.get("categories") or configured.get("categories"),
-            synonyms=configured.get("category_synonyms"),
-            defaults=taxonomy.DEFAULT_CATEGORIES,
-            max_values=options.max_categories,
-        ),
-        tags=taxonomy.build(
-            "tags",
-            options=lists.get("tags") or configured.get("tags"),
-            synonyms=configured.get("tag_synonyms"),
-            defaults=taxonomy.DEFAULT_TAGS,
-            max_values=options.max_tags,
-        ),
-        nationality=lists.get("nationality") or configured.get("nationality") or [],
-        book_format=lists.get("book_format") or configured.get("format") or [],
+    return taxonomy.build(
+        spec.column or spec.key,
+        options=spec.options or configured.get(spec.key),
+        synonyms=spec.synonyms or configured.get(f"{spec.key}_synonyms"),
+        defaults=DEFAULT_VOCABULARIES.get(spec.key, {}),
+        max_values=spec.max_values,
     )
+
+
+def page_values(page: PageDetails, spec: fields.FieldSpec) -> list[str]:
+    """مقدارهای یک صفحه برای یک ستون — از روی برچسب‌های همان ستون."""
+    return page.values_for(spec.search_labels())
+
+
+def decide(
+    spec: fields.FieldSpec,
+    title: str,
+    sources: Sequence[PageDetails],
+    common: consensus.MergedDetails,
+    options: DetailOptions,
+    norm_config: normalizer.NormalizerConfig,
+    suggest_keywords: Sequence[str] = (),
+    image_pick: images.ImagePick | None = None,
+) -> consensus.Decision:
+    """مقدار یک ستون از روی همه‌ی منابع — بر اساس **نوع** ستون، نه اسمش.
+
+    ستون‌های شناخته‌شده (نویسنده، خلاصه، ملیت، فرمت) شاهدهای اضافه‌ای دارند
+    که در :mod:`core.consensus` جمع شده‌اند؛ بقیه‌ی ستون‌ها — هر چه باشند —
+    از همین مسیر عمومی پر می‌شوند: برچسبِ هم‌نامِ ستون در منابع، بعد رأی‌گیری.
+    """
+    kind = spec.kind
+
+    if kind == fields.KIND_KEYWORD:
+        names = [name for name in (common.author.value, common.translator.value) if name]
+        keyword = normalizer.main_keyword(title, norm_config, names=names)
+        if options.use_suggest_keyword and suggest_keywords:
+            keyword = _keyword_from_suggest(keyword, suggest_keywords, norm_config) or keyword
+        return consensus.Decision(value=keyword, votes=1, sources=len(sources))
+
+    if kind == fields.KIND_IMAGE:
+        pick = image_pick or images.ImagePick()
+        return consensus.Decision(
+            value=pick.url, votes=pick.domains, sources=len(sources), note=pick.note
+        )
+
+    if kind == fields.KIND_PERSON:
+        if spec.key == "author" and common.author.filled:
+            return common.author
+        if spec.key == "translator" and common.translator.filled:
+            return common.translator
+        return consensus.merge_persons(
+            [
+                [name for value in page_values(page, spec) for name in details.clean_persons(value)]
+                for page in sources
+            ],
+            combine_scripts=options.combine_author_scripts,
+        )
+
+    if kind == fields.KIND_NUMBER:
+        if spec.key == "pages":
+            return common.pages
+        per_source = [_numbers_of(page_values(page, spec), spec) for page in sources]
+        return consensus.merge_numbers(
+            per_source,
+            tolerance=spec.tolerance,
+            min_agreement=int((options.pages or {}).get("min_agreement", 2)),
+            accept_single=bool((options.pages or {}).get("accept_single", True)),
+        )
+
+    if kind == fields.KIND_SUMMARY:
+        if spec.key == "summary" and common.summary.filled:
+            return common.summary
+        blocks = [
+            [
+                *page.summaries,
+                *[details.SummaryBlock(value, 1) for value in page_values(page, spec)],
+            ]
+            for page in sources
+        ]
+        return consensus.merge_summary(
+            blocks,
+            max_chars=int(options.summary.get("max_chars", 1200)),
+            min_chars=int(options.summary.get("min_chars", 200)),
+            max_sentences=int(options.summary.get("max_sentences", 14)),
+        )
+
+    if kind == fields.KIND_BOOL:
+        per_source = [page_values(page, spec) or _bool_probe(page, spec) for page in sources]
+        return consensus.merge_flag(
+            per_source,
+            true_label=_snap(spec.true_label, spec.options),
+            false_label=_snap(spec.false_label, spec.options),
+            extra_true=spec.true_hints,
+        )
+
+    if kind in (fields.KIND_CHOICE, fields.KIND_MULTI):
+        return _decide_choice(spec, title, sources, common, options)
+
+    # KIND_TEXT و هر چیز دیگر: مقدار متنی کوتاه با رأی‌گیری
+    decision = consensus.merge_text([page_values(page, spec) for page in sources])
+    if decision.filled and _is_code(decision.value):
+        # کد رایانه و شناسه در سیستم‌های دیگر کپی می‌شوند؛ رقم فارسی آنجا
+        # مقدار دیگری است، پس همیشه شکل لاتین نوشته می‌شود.
+        decision.value = normalizer.latin_digits(decision.value)
+    return decision
+
+
+def _decide_choice(
+    spec: fields.FieldSpec,
+    title: str,
+    sources: Sequence[PageDetails],
+    common: consensus.MergedDetails,
+    options: DetailOptions,
+) -> consensus.Decision:
+    """ستون‌های کرکره‌ای: فقط گزینه‌های مجاز، چندتایی یا تکی."""
+    vocabulary = vocabulary_for(spec, options)
+
+    if spec.key == "nationality":
+        decision = common.nationality
+        if not decision.filled:
+            return decision
+        label = options.labels.get(decision.value, decision.value)
+        return consensus.Decision(
+            value=_snap(label, vocabulary.options or spec.options),
+            votes=decision.votes,
+            sources=decision.sources,
+            note=decision.note,
+        )
+
+    if spec.key == "book_format":
+        labels = [
+            _snap(options.labels.get(code, code), vocabulary.options or spec.options)
+            for code in common.book_format.value.split(" | ")
+            if code
+        ]
+        return consensus.Decision(
+            value=taxonomy.join_values(labels, options.separator),
+            votes=common.book_format.votes,
+            sources=common.book_format.sources,
+        )
+
+    # برچسب‌های خام: تگ/دسته‌ی منابع + مقدار همان ستون در جدول مشخصات منابع
+    terms = list(common.terms)
+    for page in sources:
+        for value in page_values(page, spec):
+            for piece in taxonomy.split_values(value):
+                if piece not in terms:
+                    terms.append(piece)
+
+    matched = vocabulary.match(terms, title=title, text=common.summary.value)
+    if not matched and not spec.options:
+        # این ستون کرکره‌ای است ولی کاربر فهرستی برایش نداده و فهرست پیش‌فرض
+        # هم (که مالِ رمان است) چیزی نگرفت. تنها حقیقتِ در دسترس، برچسب خودِ
+        # منابع است: همان را می‌نویسیم تا ستون خالی نماند.
+        matched = [term for term in terms if term][: spec.max_values]
+    if spec.kind == fields.KIND_CHOICE:
+        matched = matched[:1]
+    return consensus.Decision(
+        value=taxonomy.join_values(matched, options.separator),
+        votes=len(matched),
+        sources=len(sources),
+    )
+
+
+def _is_code(value: str) -> bool:
+    """مقداری که فقط رقم (و جداکننده) است — شناسه، نه متن."""
+    stripped = re.sub(r"[\s\-_/]", "", normalizer.latin_digits(value))
+    return bool(stripped) and stripped.isdigit()
+
+
+def _numbers_of(values: Sequence[str], spec: fields.FieldSpec) -> list[int]:
+    """مقدارهای متنی یک ستون عددی → عددهای معقول همان ستون."""
+    out: list[int] = []
+    for value in values:
+        for number in re.findall(r"\d{1,6}", normalizer.latin_digits(str(value))):
+            candidate = int(number)
+            if spec.min_value <= candidate <= spec.max_value and candidate not in out:
+                out.append(candidate)
+    return out
+
+
+def _bool_probe(page: PageDetails, spec: fields.FieldSpec) -> list[str]:
+    """وقتی جدول مشخصات چیزی نگفته، عنوان و برچسب‌های خودِ محصول را نگاه کن.
+
+    «همراه با جزوه» در عنوان محصول یا تگ‌هایش، همان‌قدر شاهد است که یک ردیف
+    جدول. متن کامل صفحه عمداً گشته نمی‌شود؛ آنجا منوی سایت هم هست.
+    """
+    haystack = details.label_key(" ".join([page.title, *page.tags, *page.categories]))
+    words = [spec.column, *spec.labels, *spec.true_hints]
+    return [spec.true_label] if any(details.label_key(w) in haystack for w in words if w) else []
 
 
 def build_values(
     title: str,
     pages_of_sources: Sequence[PageDetails],
     options: DetailOptions,
-    vocab: Vocabularies,
+    specs: Sequence[fields.FieldSpec],
     norm_config: normalizer.NormalizerConfig,
     suggest_keywords: Sequence[str] = (),
     image_pick: images.ImagePick | None = None,
-) -> tuple[dict[str, str], consensus.MergedDetails]:
-    """همه‌ی صفحه‌های یک عنوان → مقدار هر ستون شیت."""
-    merged = consensus.merge(
+) -> tuple[dict[str, str], dict[str, dict], consensus.MergedDetails]:
+    """همه‌ی صفحه‌های یک عنوان → مقدار هر ستونِ شیت.
+
+    خروجی سوم (:class:`~core.consensus.MergedDetails`) برای گزارش است: همان
+    شاهدهایی که تصمیم‌ها را ساختند.
+    """
+    common = consensus.merge(
         pages_of_sources,
         summary_options=options.summary,
         pages_options=options.pages,
         combine_scripts=options.combine_author_scripts,
     )
-
-    names = [name for name in (merged.author.value, merged.translator.value) if name]
-    keyword = normalizer.main_keyword(title, norm_config, names=names)
-    if options.use_suggest_keyword and suggest_keywords:
-        keyword = _keyword_from_suggest(keyword, suggest_keywords, norm_config) or keyword
-
-    summary_text = merged.summary.value
-    matched_categories = vocab.categories.match(merged.terms, title=title, text=summary_text)
-    matched_tags = vocab.tags.match(merged.terms, title=title, text=summary_text)
-
-    nationality = ""
-    if merged.nationality.filled:
-        nationality = _snap(
-            options.labels.get(merged.nationality.value, merged.nationality.value),
-            vocab.nationality,
+    values: dict[str, str] = {}
+    evidence: dict[str, dict] = {}
+    for spec in specs:
+        decision = decide(
+            spec,
+            title,
+            pages_of_sources,
+            common,
+            options,
+            norm_config,
+            suggest_keywords=suggest_keywords,
+            image_pick=image_pick,
         )
-
-    formats = [
-        _snap(options.labels.get(code, code), vocab.book_format)
-        for code in merged.book_format.value.split(" | ")
-        if code
-    ]
-
-    values = {
-        "keyword": keyword,
-        "author": merged.author.value,
-        "summary": summary_text,
-        "categories": taxonomy.join_values(matched_categories, options.separator),
-        "tags": taxonomy.join_values(matched_tags, options.separator),
-        "nationality": nationality,
-        "book_format": taxonomy.join_values(formats, options.separator),
-        "translator": merged.translator.value,
-        "pages": merged.pages.value,
-        "image": image_pick.url if image_pick else "",
-    }
-    return values, merged
-
-
-def _keyword_from_suggest(
-    keyword: str, suggestions: Sequence[str], norm_config: normalizer.NormalizerConfig
-) -> str:
-    """اگر گوگل ساجست عبارت کوتاه‌تری از همین عنوان داشت، همان بهتر است.
-
-    ساجست یعنی «مردم واقعاً این را سرچ کرده‌اند» — قوی‌ترین دلیلی که می‌شود
-    برای انتخاب کلمه‌ی کلیدی داشت، و هزینه‌اش صفر است چون فاز ۳ قبلاً گرفته.
-    """
-    target = set(normalizer.meaningful_tokens(keyword, norm_config))
-    if not target:
-        return ""
-    best = ""
-    for suggestion in suggestions:
-        tokens = set(normalizer.meaningful_tokens(suggestion, norm_config))
-        if not tokens or not tokens <= target:
-            continue  # چیزی بیرون از عنوان دارد → کلمه‌ی کلیدی همین محصول نیست
-        if len(tokens) < 2:
-            continue
-        if not best or len(suggestion) > len(best):
-            best = suggestion
-    return best
+        values[spec.key] = decision.value
+        evidence[spec.key] = {"column": spec.column, "kind": spec.kind, **decision.as_dict()}
+    return values, evidence, common
 
 
 # ---------------------------------------------------------------------------
 # اجرا
 # ---------------------------------------------------------------------------
 
-REPORT_HEADER = (
-    "ردیف",
-    "عنوان",
-    "وضعیت",
-    "منابع",
-    "نویسنده (رأی)",
-    "صفحات (رأی)",
-    "خلاصه (منبع)",
-    "تصویر",
-    "یادداشت",
-)
+#: ستون‌های ثابت گزارش؛ بقیه‌ی ستون‌ها از روی نقشه‌ی همان شیت ساخته می‌شوند
+REPORT_LEAD = ("ردیف", "عنوان", "وضعیت", "منابع")
+REPORT_TAIL = ("یادداشت",)
+
+
+def report_header(specs: Sequence[fields.FieldSpec]) -> list[str]:
+    """سرستون‌های گزارش: برای هر ستون شیت، مقدار و تعداد رأیش."""
+    return [*REPORT_LEAD, *[f"{spec.column} (رأی)" for spec in specs], *REPORT_TAIL]
+
+
+def report_row(
+    row_number: int,
+    title: str,
+    status: str,
+    sources: int,
+    specs: Sequence[fields.FieldSpec],
+    values: dict[str, str],
+    evidence: dict[str, dict],
+    note: str,
+) -> list[object]:
+    cells: list[object] = [row_number, title, status, sources]
+    for spec in specs:
+        value = values.get(spec.key, "")
+        votes = (evidence.get(spec.key) or {}).get("votes", 0)
+        short = value if len(str(value)) <= 60 else f"{str(value)[:60]}…"
+        cells.append(f"{short} ({votes})" if value else "")
+    notes = [note]
+    for spec in specs:
+        extra = (evidence.get(spec.key) or {}).get("note", "")
+        if extra:
+            notes.append(f"{spec.column}: {extra}")
+    cells.append("؛ ".join(part for part in notes if part))
+    return cells
 
 
 def run(
@@ -477,21 +629,36 @@ def run(
     stats = DetailStats()
 
     document = document or gsheet.open_document(options.sheet)
-    columns, sheet_rows = document.read()
-    stats.rows = len(sheet_rows)
-    say(f"شیت خوانده شد: {len(sheet_rows)} ردیف — ستون‌ها: {columns.describe()}")
-    if columns.missing:
-        say(f"⚠ این ستون‌ها در شیت پیدا نشدند و پر نمی‌شوند: {'، '.join(columns.missing)}")
 
+    # اول لیست‌ها، بعد نقشه‌ی ستون‌ها: ستونی که در تبِ «لیست‌ها» فهرست دارد،
+    # کرکره‌ای شمرده می‌شود و فقط از همان فهرست پر خواهد شد.
     lists = taxonomy.options_from_lists_tab(document.read_tab(options.sheet.lists_tab))
     if lists:
         say(
             "گزینه‌های مجاز از تبِ لیست‌ها خوانده شد — "
-            + "، ".join(f"{key}: {len(value)}" for key, value in lists.items())
+            + "، ".join(f"{key}: {len(value)}" for key, value in lists.items() if key)
         )
-    vocab = build_vocabularies(options, lists)
 
-    targets = [name for name in options.writable if columns.index(name) is not None]
+    grid = document.read_grid()
+    plan = gsheet.plan_from_grid(grid, options.sheet, lists)
+    sheet_rows = gsheet.rows_from_grid(grid, plan, options.sheet.header_row)
+    stats.rows = len(sheet_rows)
+    say(f"شیت خوانده شد: {len(sheet_rows)} ردیف")
+    say("ستون‌ها — " + "، ".join(f"{col}: {KIND_LABELS.get(kind, kind)}" for col, kind in plan.describe().items()))
+
+    targets_specs = options.writable(plan)
+    targets = [spec.key for spec in targets_specs]
+    columns = plan.columns
+    # نقشه‌ی همین شیت ذخیره می‌شود تا خروجی محلی و پنل، ستون‌های واقعی همین
+    # موضوع را نشان بدهند نه فهرست ثابتِ رمان.
+    db.set_setting(
+        conn,
+        f"detail_plan:{run_id}",
+        [
+            {"column": spec.column, "key": spec.key, "kind": spec.kind}
+            for spec in plan.specs
+        ],
+    )
     if not targets:
         say("⚠ هیچ ستون قابل نوشتنی پیدا نشد؛ فقط دیتابیس پر می‌شود.")
 
@@ -547,27 +714,28 @@ def run(
                     conn, detail_id, {}, status=db.PARTIAL, note="هیچ صفحه‌ی منبعی پیدا نشد"
                 )
             report_rows.append(
-                [row.number, row.title, "بدون منبع", 0, "", "", "", "", "منبعی پیدا نشد"]
+                report_row(
+                    row.number, row.title, "بدون منبع", 0, targets_specs, {}, {}, "منبعی پیدا نشد"
+                )
             )
             continue
 
         pick = _pick_image(sources, options, fetcher)
-        values, merged = build_values(
+        values, evidence, merged = build_values(
             row.title,
             sources,
             options,
-            vocab,
+            targets_specs,
             norm_config,
             suggest_keywords=_suggest_keywords(conn, run_id, title_key),
             image_pick=pick,
         )
-
-        evidence = merged.evidence()
-        evidence["image"] = pick.as_dict()
-        required = _required_fields(wanted, values, options)
+        evidence["_منابع"] = {"value": len(sources), "votes": 0, "sources": len(sources), "note": ""}
+        required = _required_fields(targets_specs, wanted, values, options)
         missing = [name for name in required if not values.get(name)]
         status = db.DONE if not missing else db.PARTIAL
-        note = "" if not missing else "پر نشد: " + "، ".join(missing)
+        titles = {spec.key: spec.column for spec in targets_specs}
+        note = "" if not missing else "پر نشد: " + "، ".join(titles.get(n, n) for n in missing)
         with db.transaction(conn):
             db.save_detail_values(
                 conn,
@@ -583,29 +751,25 @@ def run(
 
         for name in wanted:
             value = values.get(name, "")
-            column = columns.index(name)
+            column = columns.get(name)
             if not value or column is None:
                 continue
             pending_updates.append(gsheet.CellUpdate(row.number, column, value))
-            stats.filled[name] = stats.filled.get(name, 0) + 1
+            label = titles.get(name, name)
+            stats.filled[label] = stats.filled.get(label, 0) + 1
         pending_ids.append(detail_id)
 
         report_rows.append(
-            [
+            report_row(
                 row.number,
                 row.title,
                 "کامل" if status == db.DONE else "ناقص",
                 len(sources),
-                f"{merged.author.value} ({merged.author.votes})" if merged.author.filled else "",
-                f"{merged.pages.value} ({merged.pages.votes})" if merged.pages.filled else "",
-                merged.summary.votes,
-                pick.note if pick.filled else "",
-                "؛ ".join(
-                    part
-                    for part in (note, merged.pages.note, "" if pick.filled else pick.note)
-                    if part
-                ),
-            ]
+                targets_specs,
+                values,
+                evidence,
+                note,
+            )
         )
 
         if len(pending_ids) >= options.batch_rows:
@@ -619,7 +783,7 @@ def run(
     if options.sheet.report_tab and report_rows:
         try:
             stats.report = document.write_report(
-                options.sheet.report_tab, REPORT_HEADER, report_rows
+                options.sheet.report_tab, report_header(targets_specs), report_rows
             )
         except Exception as exc:  # noqa: BLE001 — گزارش نباید کل فاز را بیندازد
             say(f"⚠ نوشتن تبِ گزارش نشد: {exc}")
@@ -636,7 +800,7 @@ def _push_unwritten(
     conn: sqlite3.Connection,
     run_id: str,
     document: gsheet.Document,
-    columns: gsheet.ColumnMap,
+    columns: dict[str, int],
     targets: Sequence[str],
     sheet_rows: Sequence[gsheet.SheetRow],
     options: DetailOptions,
@@ -658,9 +822,10 @@ def _push_unwritten(
         if sheet_row is None:
             continue
         allowed = targets if options.overwrite == "always" else sheet_row.empty_fields(targets)
+        stored = db.detail_values(record)
         for name in allowed:
-            column = columns.index(name)
-            value = record[name] or ""
+            column = columns.get(name)
+            value = stored.get(name, "")
             if column is not None and value:
                 updates.append(gsheet.CellUpdate(sheet_row.number, column, str(value)))
         ids.append(int(record["id"]))
@@ -689,18 +854,24 @@ def _needs_work(
 
 
 def _required_fields(
-    wanted: Sequence[str], values: dict[str, str], options: DetailOptions
+    specs: Sequence[fields.FieldSpec],
+    wanted: Sequence[str],
+    values: dict[str, str],
+    options: DetailOptions,
 ) -> list[str]:
     """ستون‌هایی که خالی ماندنشان واقعاً «ناقص» است.
 
-    مترجم فقط برای رمان خارجی انتظار می‌رود؛ خالی بودنش برای رمان ایرانی
-    نقص نیست و نباید ردیف را «ناقص» علامت بزند.
+    دو چیز تعیینش می‌کند: ``required`` خودِ ستون (ستون ناشناخته پیش‌فرض
+    اختیاری است، چون نمی‌دانیم منابع اصلاً چنین چیزی می‌نویسند یا نه)، و یک
+    قاعده‌ی وابسته: مترجم فقط برای اثر خارجی انتظار می‌رود.
     """
     foreign = options.labels.get("foreign", "خارجی")
+    required = {spec.key for spec in specs if spec.required}
     return [
         name
         for name in wanted
-        if not (name == "translator" and values.get("nationality") != foreign)
+        if name in required
+        and not (name == "translator" and values.get("nationality") != foreign)
     ]
 
 

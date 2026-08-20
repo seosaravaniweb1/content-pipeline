@@ -644,3 +644,26 @@ def test_detail_queue_can_be_reset(panel):
     assert status == 200 and payload["reset"] == 1
     _, after = panel("/api/details", params={"run_id": run_id})
     assert after["counts"]["pending"] == 1 and after["counts"]["pushed"] == 0
+
+
+def test_the_panel_can_inspect_a_sheet_without_writing(panel, tmp_path):
+    """«بررسی شیت» فقط می‌خواند و می‌گوید هر ستون چطور پر می‌شود."""
+    import csv
+
+    path = tmp_path / "exam.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["عنوان", "تعداد سوالات", "کد رایانه", "جزوه همراه", "وضعیت"])
+        writer.writerow(["نمونه سوالات کمک حسابدار", "", "", "", ""])
+
+    status, data = panel(
+        "/api/details/preview", method="POST", body={"file": str(path)}
+    )
+    assert status == 200 and data["rows"] == 1
+    kinds = {item["column"]: item["kind"] for item in data["plan"]}
+    assert kinds["تعداد سوالات"] == "number"
+    assert kinds["کد رایانه"] == "text"
+    assert kinds["جزوه همراه"] == "boolean"
+    assert kinds["وضعیت"] == "skip"
+    # هیچ چیزی نوشته نشده است
+    assert path.read_text(encoding="utf-8-sig").count("نمونه سوالات کمک حسابدار") == 1

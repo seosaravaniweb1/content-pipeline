@@ -245,38 +245,61 @@ def build_sheets(conn: sqlite3.Connection, run_id: str, config: Config) -> list[
         "review": Sheet(tabs.get("review", "نیاز به بازبینی دستی"), REVIEW_HEADER, review),
         "products": Sheet(
             tabs.get("products", "محصولات (دیتیل)"),
-            PRODUCTS_HEADER,
+            product_header(conn, run_id),
             product_rows(conn, run_id),
         ),
     }
     return [available[key] for key in wanted]
 
 
+def product_plan(conn: sqlite3.Connection, run_id: str) -> list[dict]:
+    """ستون‌های شیتِ همین اجرا (چیزی که فاز ۵ واقعاً دیده).
+
+    اگر فاز ۵ اجرا نشده باشد، ستون‌های پیش‌فرضِ شیت رمان برگردانده می‌شود تا
+    خروجی همیشه شکل قابل‌فهمی داشته باشد.
+    """
+    stored = db.get_setting(conn, f"detail_plan:{run_id}", None)
+    if isinstance(stored, list) and stored:
+        return [item for item in stored if isinstance(item, dict) and item.get("column")]
+    return [
+        {"column": column, "key": key, "kind": ""}
+        for column, key in zip(
+            PRODUCTS_HEADER,
+            (
+                "title",
+                "keyword",
+                "author",
+                "summary",
+                "categories",
+                "tags",
+                "nationality",
+                "book_format",
+                "translator",
+                "pages",
+                "image",
+                "status",
+                "product_id",
+            ),
+        )
+    ]
+
+
+def product_header(conn: sqlite3.Connection, run_id: str) -> list[str]:
+    return [str(item["column"]) for item in product_plan(conn, run_id)]
+
+
 def product_rows(conn: sqlite3.Connection, run_id: str) -> list[list]:
-    """ردیف‌های فاز ۵ با همان ترتیب ستون‌های گوگل‌شیت محصولات.
+    """ردیف‌های فاز ۵ با همان ترتیب ستون‌های گوگل‌شیتِ همین موضوع.
 
     ستون‌های «وضعیت» و «شناسه محصول» خالی می‌مانند: آن‌ها را اسکریپت درج
     محصول پر می‌کند و پر کردنشان از این طرف یعنی خراب کردن ورودی همان اسکریپت.
     """
+    plan = product_plan(conn, run_id)
     rows: list[list] = []
     for row in db.detail_rows(conn, run_id):
-        rows.append(
-            [
-                row["title"] or "",
-                row["keyword"] or "",
-                row["author"] or "",
-                row["summary"] or "",
-                row["categories"] or "",
-                row["tags"] or "",
-                row["nationality"] or "",
-                row["book_format"] or "",
-                row["translator"] or "",
-                row["pages"] or "",
-                row["image"] or "",
-                "",
-                "",
-            ]
-        )
+        values = db.detail_values(row)
+        values.setdefault("title", row["title"] or "")
+        rows.append([values.get(str(item.get("key")), "") for item in plan])
     return rows
 
 
