@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from ..core import db, normalizer, pipeline, presets
 from ..output import exporter
 from ..core.config import Config, ConfigError, load_config
+from ..phases import p5_details
 from . import jobs
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -171,7 +172,11 @@ def api_state(state: PanelState, query: dict) -> dict:
     return {
         "runs": runs,
         "current": current,
-        "phases": [{"n": n, "name": name} for n, name in pipeline.PHASE_NAMES.items()],
+        "phases": [
+            # فاز ۵ پیش‌فرض تیک نمی‌خورد: تا شیت محصولات تنظیم نشده باشد کاری ندارد
+            {"n": n, "name": name, "default": n <= pipeline.LAST_PHASE}
+            for n, name in pipeline.PHASE_NAMES.items()
+        ],
         "config_path": str(state.config_path) if state.config_path else "",
         "target_topic": state.config.target_topic,
         "db_path": state.config.db_path,
@@ -520,6 +525,7 @@ def api_output(state: PanelState, query: dict) -> dict:
         "archive": "محصولاتی که ساجست ندارند",
         "all": "همه با هم، با ستون «ساجست: دارد/ندارد»",
         "review": "مواردی که ابزار مطمئن نبوده",
+        "products": "ستون‌های گوگل‌شیت محصولات (خروجی فاز ۵)",
     }
     tabs = state.config.get("output.tabs", {}) or {}
     titles = {
@@ -527,12 +533,14 @@ def api_output(state: PanelState, query: dict) -> dict:
         "archive": tabs.get("archive", "آرشیو آینده"),
         "all": tabs.get("all", "همه محصولات"),
         "review": tabs.get("review", "نیاز به بازبینی دستی"),
+        "products": tabs.get("products", "محصولات (دیتیل)"),
     }
     rows = {
         "ready": counts["has_suggest"],
         "archive": counts["no_suggest"] + counts["pending_suggest"],
         "all": counts["canonical"],
         "review": counts["needs_review"] + counts["borderline"],
+        "products": counts["detail_rows"],
     }
     return {
         "run_id": run_id,
@@ -562,12 +570,14 @@ def api_sheets(state: PanelState, query: dict) -> dict:
         "archive": tabs.get("archive", "آرشیو آینده"),
         "all": tabs.get("all", "همه محصولات"),
         "review": tabs.get("review", "نیاز به بازبینی دستی"),
+        "products": tabs.get("products", "محصولات (دیتیل)"),
     }
     hints = {
         "ready": "محصولاتی که در گوگل ساجست دارند",
         "archive": "محصولاتی که ساجست ندارند",
         "all": "همه با هم، با ستون «ساجست: دارد/ندارد»",
         "review": "مواردی که ابزار مطمئن نبوده",
+        "products": "ستون‌های گوگل‌شیت محصولات (خروجی فاز ۵)",
     }
     return {
         "selected": exporter.selected_sheets(state.config),
@@ -590,6 +600,169 @@ def api_save_sheets(state: PanelState, body: dict) -> dict:
     return {"selected": chosen}
 
 
+# ---------------------------------------------------------------------------
+# فاز ۵ — تکمیل دیتیل
+# ---------------------------------------------------------------------------
+
+#: کلیدهایی که از فرم پنل پذیرفته می‌شوند (بقیه نادیده گرفته می‌شوند)
+DETAIL_TEXT_KEYS = (
+    "sheet_id",
+    "service_account_json",
+    "tab",
+    "lists_tab",
+    "report_tab",
+    "file",
+    "overwrite",
+    "multi_select_separator",
+)
+DETAIL_INT_KEYS = (
+    "header_row",
+    "limit",
+    "max_titles_per_session",
+    "max_pages_per_session",
+    "max_sources_per_title",
+    "batch_rows",
+    "max_categories",
+    "max_tags",
+)
+
+
+def detail_settings(state: PanelState) -> dict:
+    """تنظیمات ذخیره‌شده‌ی پنل (روی ``details`` در config سوار می‌شود)."""
+    stored = db.get_setting(state.conn(), "details", {}) or {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def api_details(state: PanelState, query: dict) -> dict:
+    conn = state.conn()
+    run_id = query.get("run_id") or ""
+    stored = detail_settings(state)
+    options = p5_details.options_from_config(state.config, stored)
+    counts = {"total": 0, "done": 0, "partial": 0, "pending": 0, "pushed": 0}
+    rows: list[dict] = []
+    if run_id and db.get_run(conn, run_id) is not None:
+        # شمردن با SQL انجام می‌شود نه با خواندن ۱۵ هزار ردیف در حافظه
+        counts = _detail_counts(conn, run_id)
+        rows = [
+            _detail_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM detail_rows WHERE run_id=? ORDER BY row_number, id LIMIT 50",
+                (run_id,),
+            ).fetchall()
+        ]
+    return {
+        "settings": {
+            "sheet_id": options.sheet.sheet_id,
+            "service_account_json": options.sheet.service_account_json,
+            "tab": options.sheet.tab,
+            "lists_tab": options.sheet.lists_tab,
+            "report_tab": options.sheet.report_tab,
+            "header_row": options.sheet.header_row,
+            "file": options.sheet.file,
+            "overwrite": options.overwrite,
+            "limit": options.limit,
+            "max_titles_per_session": options.max_titles_per_session,
+            "max_pages_per_session": options.max_pages_per_session,
+            "max_sources_per_title": options.max_sources_per_title,
+            "batch_rows": options.batch_rows,
+            "max_categories": options.max_categories,
+            "max_tags": options.max_tags,
+            "multi_select_separator": options.separator,
+            "image_enabled": options.image.enabled,
+            "image_min_side": options.image.min_side,
+        },
+        "ready": bool(options.sheet.sheet_id or options.sheet.file),
+        "gspread": _gspread_available(),
+        "counts": counts,
+        "rows": rows,
+        "columns": list(p5_details.FILLABLE),
+        "never_write": list(options.sheet.never_write),
+    }
+
+
+def _detail_counts(conn: sqlite3.Connection, run_id: str) -> dict[str, int]:
+    queries = {
+        "total": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=?",
+        "done": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=? AND status='done'",
+        "partial": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=? AND status='partial'",
+        "pending": (
+            "SELECT COUNT(*) c FROM detail_rows WHERE run_id=?"
+            " AND (status IS NULL OR status='pending')"
+        ),
+        "pushed": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=? AND pushed=1",
+    }
+    return {
+        key: int(conn.execute(query, (run_id,)).fetchone()["c"])
+        for key, query in queries.items()
+    }
+
+
+def _detail_dict(row: sqlite3.Row) -> dict:
+    return {
+        "row_number": row["row_number"],
+        "title": row["title"],
+        "status": row["status"] or db.PENDING,
+        "pushed": bool(row["pushed"]),
+        "note": row["note"] or "",
+        "values": {name: (row[name] or "") for name in db.DETAIL_FIELDS},
+    }
+
+
+def _gspread_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("gspread") is not None
+
+
+def api_save_details(state: PanelState, body: dict) -> dict:
+    """ذخیره‌ی تنظیمات تب «تکمیل دیتیل».
+
+    عمداً در دیتابیس ذخیره می‌شود نه در ``config.yaml``: نوشتن دوباره‌ی YAML
+    توضیحات و ترتیب فایل کاربر را از بین می‌برد. همین مقدارها روی config
+    سوار می‌شوند و اجرای CLI هم از آن‌ها استفاده می‌کند.
+    """
+    _guard_idle(state)
+    settings = detail_settings(state)
+    for key in DETAIL_TEXT_KEYS:
+        if key in body:
+            settings[key] = str(body.get(key) or "").strip()
+    for key in DETAIL_INT_KEYS:
+        if key in body:
+            try:
+                settings[key] = max(0, int(body.get(key) or 0))
+            except (TypeError, ValueError):
+                raise ApiError(f"مقدار «{key}» باید عدد باشد.") from None
+    if "image_enabled" in body or "image_min_side" in body:
+        image = dict(settings.get("image") or {})
+        if "image_enabled" in body:
+            image["enabled"] = bool(body.get("image_enabled"))
+        if "image_min_side" in body:
+            try:
+                image["min_side"] = max(0, int(body.get("image_min_side") or 0))
+            except (TypeError, ValueError):
+                raise ApiError("حداقل اندازه‌ی تصویر باید عدد باشد.") from None
+        settings["image"] = image
+
+    if settings.get("overwrite") not in ("empty", "always"):
+        settings["overwrite"] = "empty"
+    if settings.get("sheet_id") and not settings.get("service_account_json"):
+        raise ApiError(
+            "برای گوگل‌شیت، مسیر فایل json سرویس‌اکانت هم لازم است."
+            " (یا به‌جای شیت، یک فایل csv/xlsx بدهید.)"
+        )
+    db.set_setting(state.conn(), "details", settings)
+    state.runner.config = state.config
+    return api_details(state, {"run_id": body.get("run_id") or ""})
+
+
+def api_reset_details(state: PanelState, body: dict) -> dict:
+    """همه‌ی ردیف‌ها دوباره در صف — برای وقتی تنظیمات عوض شده و می‌خواهید
+    ستون‌ها از نو ساخته شوند."""
+    _guard_idle(state)
+    run_id = state.resolve_run(body.get("run_id"))
+    return {"reset": db.reset_detail_rows(state.conn(), run_id)}
+
+
 GET_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/state": api_state,
     "/api/config": api_get_config,
@@ -602,6 +775,7 @@ GET_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/presets": api_presets,
     "/api/plan": api_plan,
     "/api/sheets": api_sheets,
+    "/api/details": api_details,
 }
 
 POST_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
@@ -616,6 +790,8 @@ POST_ROUTES: dict[str, Callable[[PanelState, dict], Any]] = {
     "/api/products/review": api_review_flag,
     "/api/plan": api_save_plan,
     "/api/sheets": api_save_sheets,
+    "/api/details": api_save_details,
+    "/api/details/reset": api_reset_details,
 }
 
 

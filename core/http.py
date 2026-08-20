@@ -127,13 +127,18 @@ class Fetcher:
         timeout: int = 20,
         respect_robots: bool = True,
         playwright_fallback: bool = True,
+        limiter: RateLimiter | None = None,
+        robots: RobotsCache | None = None,
     ) -> None:
         self.user_agent = user_agent
         self.timeout = timeout
         self.respect_robots = respect_robots
         self.playwright_fallback = playwright_fallback
-        self.limiter = RateLimiter(requests_per_second)
-        self.robots = RobotsCache(user_agent, timeout)
+        # limiter/robots از بیرون داده می‌شوند وقتی چند Fetcher (چند ترد) داریم:
+        # سقف «۱ درخواست در ثانیه به هر دامنه» باید بین همه مشترک باشد، وگرنه
+        # n ترد یعنی n برابر شدن نرخ درخواست به سایت هدف.
+        self.limiter = limiter or RateLimiter(requests_per_second)
+        self.robots = robots or RobotsCache(user_agent, timeout)
         self._session: Any = None
         self._backend = self._pick_backend()
         self._browser: Any = None
@@ -207,19 +212,31 @@ class Fetcher:
         except Exception as exc:  # pragma: no cover - وابسته به شبکه
             return FetchResult(url, 0, "", via=self._backend, error=str(exc))
 
-    def fetch_bytes(self, url: str) -> tuple[int, bytes]:
-        """دانلود دودویی (برای تصاویر)."""
+    def fetch_bytes(self, url: str, max_bytes: int = 0) -> tuple[int, bytes]:
+        """دانلود دودویی (برای تصاویر).
+
+        ``max_bytes`` یعنی «فقط همین‌قدر از ابتدای فایل را می‌خواهم»: با هدر
+        ``Range`` درخواست می‌شود و اگر سرور آن را نادیده گرفت، خودمان بیشتر از
+        این نمی‌خوانیم. اندازه‌ی یک تصویر از چند کیلوبایت اولش خوانده می‌شود،
+        پس دانلود کامل هزاران کاور بی‌دلیل است.
+        """
         self.limiter.wait(domain_of(url))
         headers = {"User-Agent": self.user_agent}
+        if max_bytes > 0:
+            headers["Range"] = f"bytes=0-{max_bytes - 1}"
         try:
             if self._backend == "curl_cffi":  # pragma: no cover - نیازمند curl_cffi
                 response = self._session.get(
                     url, headers=headers, timeout=self.timeout, impersonate="chrome"
                 )
-                return response.status_code, response.content
+                body = response.content or b""
+                return response.status_code, body[:max_bytes] if max_bytes > 0 else body
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.status, response.read()
+                body = response.read(max_bytes) if max_bytes > 0 else response.read()
+                return response.status, body
+        except urllib.error.HTTPError as exc:  # pragma: no cover - وابسته به شبکه
+            return exc.code, b""
         except Exception:  # pragma: no cover - وابسته به شبکه
             return 0, b""
 
@@ -277,7 +294,11 @@ class Fetcher:
         self.close()
 
 
-def fetcher_from_config(config: Any) -> Fetcher:
+def fetcher_from_config(
+    config: Any,
+    limiter: RateLimiter | None = None,
+    robots: RobotsCache | None = None,
+) -> Fetcher:
     # داکیومنت: حداکثر ۱ درخواست در ثانیه به هر دامنه (crawl.delay_seconds)
     delay = float(config.get("crawl.delay_seconds", 1.0))
     return Fetcher(
@@ -286,4 +307,6 @@ def fetcher_from_config(config: Any) -> Fetcher:
         timeout=int(config.get("crawl.timeout", 20)),
         respect_robots=bool(config.get("crawl.respect_robots", True)),
         playwright_fallback=bool(config.get("crawl.playwright_fallback", True)),
+        limiter=limiter,
+        robots=robots,
     )

@@ -293,6 +293,16 @@ def _drop_phrases(tokens: list[str], phrases: Sequence[tuple[str, ...]]) -> list
 # ---------------------------------------------------------------------------
 
 
+def latin_digits(text: str) -> str:
+    """ارقام فارسی/عربی → لاتین. برای وقتی عدد باید عدد شود («۳۹۸» → ``398``)."""
+    return _map_digits(text or "", "en")
+
+
+def persian_digits(text: str) -> str:
+    """ارقام لاتین → فارسی. برای نوشتن در خروجی فارسی."""
+    return _map_digits(text or "", "fa")
+
+
 def normalize_display(text: str, config: NormalizerConfig = DEFAULT_CONFIG) -> str:
     """شکل خوانا: نرمال‌سازی کاراکتری بدون حذف کلمات ایستا و بدون حذف نیم‌فاصله."""
     return _normalize_chars(text, config)
@@ -443,6 +453,91 @@ def search_query(
         if len(kept) >= max_words:
             break
     return " ".join(kept) or display
+
+
+#: کلمه‌های دستوری. در «تطبیق» حذفشان درست است ولی در **کلمه‌ی کلیدی** نه:
+#: «رمان روز نود و سوم» بدون «و» دیگر آن عبارتی نیست که کسی سرچ می‌کند.
+GRAMMAR_WORDS: frozenset[str] = frozenset({"با", "و", "در", "برای", "به", "از", "ی"})
+
+#: نشانگرهایی که بعدشان قطعاً نام شخص می‌آید. «از» و «قلم» عمداً نیستند،
+#: چون خودشان می‌توانند وسط عنوان بیایند («رمان بخشی از من»).
+STRONG_AUTHOR_MARKERS: frozenset[str] = AUTHOR_MARKERS - {"از", "قلم", "شاعر", "خواننده"}
+
+
+def keyword_noise(config: NormalizerConfig = DEFAULT_CONFIG) -> frozenset[str]:
+    """کلماتی که از کلمه‌ی کلیدی حذف می‌شوند: تجاری‌ها، نه دستوری‌ها."""
+    words = (CORE_STOPWORDS | EXTRA_STOPWORDS | QUERY_NOISE) - GRAMMAR_WORDS
+    words |= set(config.custom_stopwords)
+    return frozenset(_normalize_chars(word, config) for word in words)
+
+
+def main_keyword(
+    title: str,
+    config: NormalizerConfig = DEFAULT_CONFIG,
+    names: Sequence[str] = (),
+    max_words: int = 8,
+) -> str:
+    """عنوان محصول → «کلمه‌ی کلیدی اصلی» برای ستون دوم شیت.
+
+    قاعده‌ای که از خودِ شیت‌های پرشده درآمده::
+
+        دانلود پی دی اف رمان روز نود و سوم        → رمان روز نود و سوم
+        رمان ماه طوفان پی دی اف کامل زینب ایلخانی → رمان ماه طوفان
+        پی دی اف رمان نجیب بی آبرو هاله نژاد صاحبی → رمان نجیب بی آبرو
+
+    یعنی: کلمه‌های فروشگاهی («دانلود»، «پی دی اف»، «کامل») حذف، و از جایی که
+    **نام نویسنده** یا نشانه‌ی جلد شروع می‌شود عنوان بریده می‌شود. برای همین
+    ``names`` (نویسنده و مترجمی که فاز ۵ پیدا کرده) ورودی این تابع است؛ بدون
+    آن نمی‌شود فهمید «هاله» بخشی از نام رمان است یا اول نام نویسنده.
+    """
+    display = collapse_repeats(normalize_display(title, config))
+    tokens = [t for t in display.split() if t]
+    if not tokens:
+        return ""
+    probes = [_apply_zwnj_policy(token, config.zwnj) for token in tokens]
+
+    # عبارت‌های چندکلمه‌ای («پی دی اف») باید با هم حذف شوند، نه تک‌تک
+    phrases = tuple(
+        tuple(_normalize_chars(word, config) for word in phrase) for phrase in PHRASE_STOPWORDS
+    )
+    dropped = [False] * len(tokens)
+    index = 0
+    while index < len(tokens):
+        length = max(
+            (len(phrase) for phrase in phrases if tuple(probes[index : index + len(phrase)]) == phrase),
+            default=0,
+        )
+        if length:
+            for position in range(index, index + length):
+                dropped[position] = True
+            index += length
+            continue
+        index += 1
+
+    noise = keyword_noise(config)
+    name_words = {
+        _apply_zwnj_policy(_normalize_chars(word, config), config.zwnj)
+        for name in names
+        for word in str(name).split()
+    }
+    name_words.discard("")
+
+    kept: list[str] = []
+    for position, (token, probe) in enumerate(zip(tokens, probes)):
+        if dropped[position]:
+            continue
+        if probe in name_words or probe in VOLUME_MARKERS or probe in STRONG_AUTHOR_MARKERS:
+            break  # از اینجا به بعد نام نویسنده/شماره‌ی جلد است، نه نام رمان
+        if probe == _normalize_chars("از", config) and position + 1 < len(tokens):
+            if probes[position + 1] in name_words:
+                break
+        if probe in noise or (config.strip_years and _is_year(probe)):
+            continue
+        kept.append(token)
+        if len(kept) >= max_words:
+            break
+    # اگر همه‌چیز حذف شد (عنوان فقط از کلمه‌های فروشگاهی ساخته شده بود)
+    return " ".join(kept) or search_query(title, config, max_words)
 
 
 #: پیشوندهای رایجی که کاربر فارسی جلوی نام محصول تایپ می‌کند.

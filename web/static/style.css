@@ -232,3 +232,12 @@ textarea#sitesText {
 .dl:last-child { border-bottom: 0; }
 .dl b { min-width: 11rem; }
 .dl .muted { flex: 1; }
+
+/* تب «تکمیل دیتیل» — ورودی‌های داخل جدول کلید/مقدار باید جا داشته باشند
+   (شناسه‌ی شیت و مسیر فایل، هر دو بلندند). */
+#tab-details table.kv input,
+#tab-details table.kv select { width: 100%; max-width: 34rem; }
+#tab-details table.kv input[type="number"] { width: 7rem; }
+#tab-details table.kv input[type="checkbox"] { width: auto; }
+#tab-details table.kv td { padding: .35rem 0; vertical-align: middle; }
+#tab-details table.grid td { max-width: 22rem; overflow-wrap: anywhere; }

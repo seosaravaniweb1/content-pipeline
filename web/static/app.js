@@ -72,6 +72,7 @@ for (const button of document.querySelectorAll("#tabs button")) {
     if (button.dataset.tab === "products") loadProducts();
     if (button.dataset.tab === "review") loadReview();
     if (button.dataset.tab === "config") loadConfig();
+    if (button.dataset.tab === "details") loadDetails();
   });
 }
 
@@ -270,7 +271,9 @@ async function refreshState() {
   if (data.phases.length && !$("#phaseChecks").childElementCount) {
     $("#phaseChecks").replaceChildren(...data.phases.map((phase) =>
       el("label", {}, [
-        el("input", { type: "checkbox", value: phase.n, checked: true, className: "phase" }),
+        el("input", {
+        type: "checkbox", value: phase.n, checked: phase.default !== false, className: "phase",
+      }),
         `فاز ${phase.n} — ${phase.name}`,
       ])));
     $("#phaseChecks").addEventListener("change", updateSuggestWarning);
@@ -718,6 +721,101 @@ $("#configSave").addEventListener("click", async () => {
   } catch (error) { toast(error.message, true); }
 });
 
+/* ---------------------------------------------------------- تکمیل دیتیل */
+const DETAIL_FIELDS = [
+  ["dSheetId", "sheet_id"],
+  ["dServiceAccount", "service_account_json"],
+  ["dTab", "tab"],
+  ["dListsTab", "lists_tab"],
+  ["dReportTab", "report_tab"],
+  ["dFile", "file"],
+  ["dOverwrite", "overwrite"],
+  ["dSeparator", "multi_select_separator"],
+  ["dHeaderRow", "header_row"],
+  ["dLimit", "limit"],
+  ["dMaxTitles", "max_titles_per_session"],
+  ["dMaxSources", "max_sources_per_title"],
+  ["dBatch", "batch_rows"],
+  ["dMaxCats", "max_categories"],
+  ["dMaxTags", "max_tags"],
+];
+
+const DETAIL_STATUS = { done: "کامل", partial: "ناقص", pending: "در صف" };
+
+async function loadDetails() {
+  try {
+    const data = await api("/api/details", { params: { run_id: state.runId } });
+    for (const [id, key] of DETAIL_FIELDS) $(`#${id}`).value = data.settings[key] ?? "";
+    $("#dImageEnabled").checked = data.settings.image_enabled !== false;
+    $("#dImageMinSide").value = data.settings.image_min_side ?? 400;
+    renderDetailStatus(data);
+  } catch (error) { toast(error.message, true); }
+}
+
+function renderDetailStatus(data) {
+  const counts = data.counts || {};
+  $("#dCounters").replaceChildren(...[
+    ["ردیف شیت", counts.total], ["کامل", counts.done],
+    ["ناقص", counts.partial], ["در صف", counts.pending], ["نوشته‌شده در شیت", counts.pushed],
+  ].map(([label, value]) => el("div", { className: "card" }, [
+    el("b", { textContent: value ?? "—" }), el("span", { textContent: label }),
+  ])));
+
+  const notes = [];
+  if (!data.ready) notes.push("هنوز شناسه‌ی شیت یا فایل ورودی داده نشده");
+  if (data.settings.sheet_id && !data.gspread) notes.push("gspread نصب نیست: pip install gspread");
+  $("#dStatus").textContent = notes.join(" — ") || "آماده‌ی اجرا";
+
+  $("#dTable tbody").replaceChildren(...(data.rows || []).map((row) => el("tr", {}, [
+    el("td", { textContent: row.row_number || "—" }),
+    el("td", { textContent: row.title }),
+    el("td", { textContent: row.values.keyword }),
+    el("td", { textContent: row.values.author }),
+    el("td", { textContent: row.values.pages }),
+    el("td", { textContent: row.values.categories }),
+    el("td", {}, [row.values.image
+      ? el("a", { href: row.values.image, target: "_blank", rel: "noreferrer", textContent: "کاور" })
+      : document.createTextNode("—")]),
+    el("td", { textContent: DETAIL_STATUS[row.status] || row.status, title: row.note || "" }),
+  ])));
+}
+
+function detailBody() {
+  const body = { run_id: state.runId };
+  for (const [id, key] of DETAIL_FIELDS) body[key] = $(`#${id}`).value.trim();
+  body.image_enabled = $("#dImageEnabled").checked;
+  body.image_min_side = Number($("#dImageMinSide").value) || 0;
+  return body;
+}
+
+$("#dSaveBtn").addEventListener("click", async () => {
+  try {
+    renderDetailStatus(await api("/api/details", { method: "POST", body: detailBody() }));
+    toast("تنظیمات تکمیل دیتیل ذخیره شد.");
+  } catch (error) { toast(error.message, true); }
+});
+
+$("#dRunBtn").addEventListener("click", async () => {
+  if (!state.runId) return toast("اول یک اجرا بسازید یا انتخاب کنید.", true);
+  try {
+    await api("/api/details", { method: "POST", body: detailBody() });
+    $("#log").textContent = "";
+    state.logNext = 0;
+    applyJob(await api("/api/job", { method: "POST", body: { run_id: state.runId, phases: [5] } }));
+    toast("فاز ۵ شروع شد — پیشرفتش در تبِ «اجرا» است.");
+  } catch (error) { toast(error.message, true); }
+});
+
+$("#dResetBtn").addEventListener("click", async () => {
+  if (!state.runId) return toast("اول یک اجرا انتخاب کنید.", true);
+  if (!confirm("همه‌ی ردیف‌ها دوباره در صف تکمیل قرار بگیرند؟")) return;
+  try {
+    const data = await api("/api/details/reset", { method: "POST", body: { run_id: state.runId } });
+    toast(`${data.reset} ردیف به صف برگشت.`);
+    await loadDetails();
+  } catch (error) { toast(error.message, true); }
+});
+
 /* ----------------------------------------------------------------- ابزار */
 async function runNormalize() {
   try {
@@ -741,6 +839,7 @@ async function poll() {
     if (wasRunning && job.status !== "running") {
       await refreshState();
       if ($("#tab-products").classList.contains("active")) loadProducts();
+      if ($("#tab-details").classList.contains("active")) loadDetails();
       toast(job.status === "failed" ? `اجرا شکست خورد: ${job.error}` : "اجرا تمام شد.",
             job.status === "failed");
     }

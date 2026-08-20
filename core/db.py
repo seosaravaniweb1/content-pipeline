@@ -13,11 +13,11 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 RUNNING = "running"
 COMPLETED = "completed"
@@ -80,10 +80,52 @@ CREATE TABLE IF NOT EXISTS api_cache (
     created_at TIMESTAMP
 );
 
+-- فاز ۵ — یک ردیف به ازای هر عنوانِ گوگل‌شیت محصولات
+CREATE TABLE IF NOT EXISTS detail_rows (
+    id          INTEGER PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    row_number  INTEGER,   -- شماره‌ی ردیف در گوگل‌شیت (۰ = ورودی فایلی)
+    title       TEXT,
+    title_key   TEXT,      -- عنوان نرمال‌شده؛ کلید یکتای همان اجرا
+    keyword     TEXT,
+    author      TEXT,
+    summary     TEXT,
+    categories  TEXT,
+    tags        TEXT,
+    nationality TEXT,
+    book_format TEXT,      -- «format» کلمه‌ی کلیدی SQL نیست ولی گیج‌کننده است
+    translator  TEXT,
+    pages       TEXT,
+    image       TEXT,
+    sources     TEXT,      -- JSON: آدرس منابعی که این ردیف از آن‌ها ساخته شد
+    evidence    TEXT,      -- JSON: برای هر ستون، دلیل و شماره‌ی منابع موافق
+    status      TEXT,      -- pending | done | partial | failed
+    note        TEXT,
+    pushed      BOOLEAN DEFAULT 0,
+    updated_at  TIMESTAMP,
+    UNIQUE(run_id, title_key)
+);
+
+-- کش استخراج صفحه‌ها: یک صفحه‌ی منبع دو بار دانلود نمی‌شود
+CREATE TABLE IF NOT EXISTS detail_pages (
+    url        TEXT PRIMARY KEY,
+    domain     TEXT,
+    payload    TEXT,      -- JSON خروجی core.details
+    fetched_at TIMESTAMP
+);
+
+-- تنظیمات قابل‌ویرایش از پنل (روی config.yaml را می‌پوشانند)
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_raw_run       ON raw_products(run_id, is_relevant);
 CREATE INDEX IF NOT EXISTS idx_canon_run     ON canonical_products(run_id);
 CREATE INDEX IF NOT EXISTS idx_mapping_canon ON product_mapping(canonical_id);
 CREATE INDEX IF NOT EXISTS idx_lsi_canon     ON lsi_keywords(canonical_id);
+CREATE INDEX IF NOT EXISTS idx_detail_run    ON detail_rows(run_id, status);
 """
 
 
@@ -642,4 +684,206 @@ def delete_run(conn: sqlite3.Connection, run_id: str) -> None:
         )
         conn.execute("DELETE FROM canonical_products WHERE run_id=?", (run_id,))
         conn.execute("DELETE FROM raw_products WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM detail_rows WHERE run_id=?", (run_id,))
         conn.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
+
+
+# ---------------------------------------------------------------------------
+# فاز ۵ — ردیف‌های گوگل‌شیت محصولات
+# ---------------------------------------------------------------------------
+
+#: ستون‌هایی که فاز ۵ پر می‌کند. ترتیب همان ترتیب گوگل‌شیت کاربر است.
+DETAIL_FIELDS: tuple[str, ...] = (
+    "keyword",
+    "author",
+    "summary",
+    "categories",
+    "tags",
+    "nationality",
+    "book_format",
+    "translator",
+    "pages",
+    "image",
+)
+
+PENDING = "pending"
+PARTIAL = "partial"
+DONE = "done"
+
+
+def upsert_detail_row(
+    conn: sqlite3.Connection,
+    run_id: str,
+    title: str,
+    title_key: str,
+    row_number: int = 0,
+) -> int:
+    """ثبت یک عنوان در صف فاز ۵ (idempotent).
+
+    ``title_key`` عنوان نرمال‌شده است، نه خود عنوان: همان عنوان با «دانلود» و
+    بدون آن دو ردیف جدا نمی‌سازد. اگر ردیف بود، فقط شماره‌ی ردیفِ شیت و متن
+    عنوان تازه می‌شود (کاربر ممکن است عنوان را در شیت ویرایش کرده باشد).
+    """
+    conn.execute(
+        """INSERT INTO detail_rows (run_id, row_number, title, title_key, status, updated_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(run_id, title_key) DO UPDATE SET
+               row_number=excluded.row_number,
+               title=excluded.title""",
+        (run_id, row_number, title, title_key, PENDING, utcnow()),
+    )
+    row = conn.execute(
+        "SELECT id FROM detail_rows WHERE run_id=? AND title_key=?", (run_id, title_key)
+    ).fetchone()
+    return int(row["id"])
+
+
+def save_detail_values(
+    conn: sqlite3.Connection,
+    detail_id: int,
+    values: dict[str, Any],
+    sources: Sequence[str] = (),
+    evidence: dict[str, Any] | None = None,
+    status: str = DONE,
+    note: str = "",
+) -> None:
+    """نوشتن مقادیر استخراج‌شده‌ی یک ردیف.
+
+    فقط ستون‌هایی که مقدار دارند نوشته می‌شوند؛ ستون خالی، مقدار قبلی را
+    پاک نمی‌کند تا اجرای دوباره‌ی فاز، کارِ اجرای قبلی را خراب نکند.
+    """
+    sets = ["status=?", "note=?", "sources=?", "evidence=?", "pushed=0", "updated_at=?"]
+    params: list[Any] = [
+        status,
+        note,
+        json.dumps(list(sources), ensure_ascii=False),
+        json.dumps(evidence or {}, ensure_ascii=False),
+        utcnow(),
+    ]
+    for field_name in DETAIL_FIELDS:
+        value = values.get(field_name)
+        if value in (None, ""):
+            continue
+        sets.append(f"{field_name}=?")
+        params.append(str(value))
+    params.append(detail_id)
+    conn.execute(f"UPDATE detail_rows SET {', '.join(sets)} WHERE id=?", params)
+
+
+def mark_detail_pushed(conn: sqlite3.Connection, detail_ids: Sequence[int]) -> None:
+    """این ردیف‌ها در گوگل‌شیت نوشته شدند."""
+    if not detail_ids:
+        return
+    with transaction(conn):
+        conn.executemany(
+            "UPDATE detail_rows SET pushed=1 WHERE id=?", [(int(i),) for i in detail_ids]
+        )
+
+
+def detail_rows(
+    conn: sqlite3.Connection, run_id: str, status: str | None = None
+) -> list[sqlite3.Row]:
+    if status is None:
+        return conn.execute(
+            "SELECT * FROM detail_rows WHERE run_id=? ORDER BY row_number, id", (run_id,)
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM detail_rows WHERE run_id=? AND status=? ORDER BY row_number, id",
+        (run_id, status),
+    ).fetchall()
+
+
+def pending_detail_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """ردیف‌هایی که هنوز تکمیل نشده‌اند — پایه‌ی resume فاز ۵."""
+    return conn.execute(
+        """SELECT * FROM detail_rows WHERE run_id=? AND (status IS NULL OR status IN (?,?))
+           ORDER BY row_number, id""",
+        (run_id, PENDING, PARTIAL),
+    ).fetchall()
+
+
+def unpushed_detail_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """ردیف‌های تکمیل‌شده‌ای که هنوز در شیت نوشته نشده‌اند."""
+    return conn.execute(
+        """SELECT * FROM detail_rows
+           WHERE run_id=? AND pushed=0 AND status IN (?,?)
+           ORDER BY row_number, id""",
+        (run_id, DONE, PARTIAL),
+    ).fetchall()
+
+
+def detail_row_by_key(
+    conn: sqlite3.Connection, run_id: str, title_key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM detail_rows WHERE run_id=? AND title_key=?", (run_id, title_key)
+    ).fetchone()
+
+
+def reset_detail_rows(conn: sqlite3.Connection, run_id: str) -> int:
+    """برگرداندن همه‌ی ردیف‌ها به صف (برای اجرای دوباره‌ی کامل فاز ۵)."""
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE detail_rows SET status=?, pushed=0 WHERE run_id=?", (PENDING, run_id)
+        )
+    return int(cursor.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# کش استخراج صفحه‌ها
+# ---------------------------------------------------------------------------
+
+
+def get_page_payload(
+    conn: sqlite3.Connection, url: str, ttl_days: int | None = None
+) -> dict | None:
+    row = conn.execute("SELECT * FROM detail_pages WHERE url=?", (url,)).fetchone()
+    if row is None:
+        return None
+    if ttl_days:
+        try:
+            fetched = datetime.fromisoformat(row["fetched_at"])
+        except (TypeError, ValueError):
+            fetched = None
+        if fetched is not None:
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - fetched > timedelta(days=ttl_days):
+                return None
+    try:
+        data = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def put_page_payload(conn: sqlite3.Connection, url: str, domain: str, payload: dict) -> None:
+    with transaction(conn):
+        conn.execute(
+            """INSERT OR REPLACE INTO detail_pages (url, domain, payload, fetched_at)
+               VALUES (?,?,?,?)""",
+            (url, domain, json.dumps(payload, ensure_ascii=False), utcnow()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# تنظیمات پنل
+# ---------------------------------------------------------------------------
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if row is None or row["value"] is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    with transaction(conn):
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+            (key, json.dumps(value, ensure_ascii=False), utcnow()),
+        )

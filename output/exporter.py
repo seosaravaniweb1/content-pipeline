@@ -57,8 +57,27 @@ ALL_HEADER = [
 SUGGEST_LABEL = {HAS_SUGGEST: "دارد", NO_SUGGEST: "ندارد", "": "بررسی نشده"}
 
 # کلید هر شیت، برای انتخاب در config و پنل
-SHEET_KEYS = ("ready", "archive", "all", "review")
-DEFAULT_SHEETS = list(SHEET_KEYS)
+SHEET_KEYS = ("ready", "archive", "all", "review", "products")
+#: «products» عمداً در پیش‌فرض نیست: تا فاز ۵ اجرا نشده باشد خالی است.
+DEFAULT_SHEETS = ["ready", "archive", "all", "review"]
+
+#: ستون‌های شیت محصولات — عین همان چیزی که اسکریپت درج محصول می‌خواند.
+#: عنوان ستون‌ها را دست نزنید مگر در گوگل‌شیت خودتان هم عوضشان کنید.
+PRODUCTS_HEADER = [
+    "عنوان",
+    "keyword",
+    "Author",
+    "Summary",
+    "Categories",
+    "Tags",
+    "Nationality",
+    "Format",
+    "Translator",
+    "Pages",
+    "Image",
+    "Status",
+    "Product ID",
+]
 
 #: چند ستون جدا برای کلمات ساجست (ساجست ۱، ساجست ۲، ...) کنار ستون یکجا
 DEFAULT_KEYWORD_COLUMNS = 10
@@ -87,6 +106,7 @@ class ExportStats:
     archive_rows: int = 0
     all_rows: int = 0
     review_rows: int = 0
+    product_rows: int = 0
     local_path: str = ""
     sheet_url: str = ""
 
@@ -96,6 +116,8 @@ class ExportStats:
             f"آرشیو آینده: {self.archive_rows}، همه محصولات: {self.all_rows}، "
             f"نیاز به بازبینی: {self.review_rows}"
         ]
+        if self.product_rows:
+            parts.append(f"محصولات (دیتیل): {self.product_rows}")
         if self.local_path:
             parts.append(f"فایل محلی: {self.local_path}")
         if self.sheet_url:
@@ -221,8 +243,41 @@ def build_sheets(conn: sqlite3.Connection, run_id: str, config: Config) -> list[
         "archive": Sheet(tabs.get("archive", "آرشیو آینده"), ARCHIVE_HEADER, archive),
         "all": Sheet(tabs.get("all", "همه محصولات"), ALL_HEADER + extra, everything),
         "review": Sheet(tabs.get("review", "نیاز به بازبینی دستی"), REVIEW_HEADER, review),
+        "products": Sheet(
+            tabs.get("products", "محصولات (دیتیل)"),
+            PRODUCTS_HEADER,
+            product_rows(conn, run_id),
+        ),
     }
     return [available[key] for key in wanted]
+
+
+def product_rows(conn: sqlite3.Connection, run_id: str) -> list[list]:
+    """ردیف‌های فاز ۵ با همان ترتیب ستون‌های گوگل‌شیت محصولات.
+
+    ستون‌های «وضعیت» و «شناسه محصول» خالی می‌مانند: آن‌ها را اسکریپت درج
+    محصول پر می‌کند و پر کردنشان از این طرف یعنی خراب کردن ورودی همان اسکریپت.
+    """
+    rows: list[list] = []
+    for row in db.detail_rows(conn, run_id):
+        rows.append(
+            [
+                row["title"] or "",
+                row["keyword"] or "",
+                row["author"] or "",
+                row["summary"] or "",
+                row["categories"] or "",
+                row["tags"] or "",
+                row["nationality"] or "",
+                row["book_format"] or "",
+                row["translator"] or "",
+                row["pages"] or "",
+                row["image"] or "",
+                "",
+                "",
+            ]
+        )
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +430,7 @@ def run(
         archive_rows=counts.get("archive", 0),
         all_rows=counts.get("all", 0),
         review_rows=counts.get("review", 0),
+        product_rows=counts.get("products", 0),
     )
 
     xlsx_path = config.get("output.xlsx_path", "content_pipeline/data/output-{run_id}.xlsx")

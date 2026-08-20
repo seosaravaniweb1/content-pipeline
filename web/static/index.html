@@ -26,6 +26,7 @@
   <button data-tab="run">اجرا</button>
   <button data-tab="products">محصولات</button>
   <button data-tab="review">بازبینی دستی</button>
+  <button data-tab="details">تکمیل دیتیل</button>
   <button data-tab="config">تنظیمات</button>
   <button data-tab="tools">ابزار</button>
 </nav>
@@ -217,6 +218,107 @@
         مطمئن نبود جزو دسته‌ی شما هستند یا نه، پس نه ردشان کرد نه وارد محصولات کرد.
       </p>
       <div id="borderlineList"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------- تکمیل دیتیل -->
+  <section id="tab-details" class="tab">
+    <div class="panel">
+      <h2>۱. گوگل‌شیت محصولات</h2>
+      <p class="muted">
+        همان شیتی که بعداً به اسکریپت درج محصول می‌دهید. عنوان‌ها را شما در ستون اول
+        گذاشته‌اید؛ فاز ۵ بقیه‌ی ستون‌ها را از روی منابع پر می‌کند.
+      </p>
+      <div class="warn">
+        <b>سه کار قبل از اولین اجرا:</b><br>
+        ۱. <code dir="ltr">pip install gspread</code><br>
+        ۲. در Google Cloud یک <b>service account</b> بسازید و فایل json کلیدش را دانلود کنید.<br>
+        ۳. گوگل‌شیت را با ایمیل همان service account به‌صورت <b>ویرایشگر</b> به اشتراک بگذارید.<br>
+        شناسه‌ی شیت همان تکه‌ی وسط آدرس است:
+        <code dir="ltr">docs.google.com/spreadsheets/d/<b>SHEET_ID</b>/edit</code>
+      </div>
+      <table class="kv">
+        <tr><td>شناسه‌ی شیت</td><td><input id="dSheetId" dir="ltr" placeholder="1AbC...xyz"></td></tr>
+        <tr><td>فایل service account</td><td><input id="dServiceAccount" dir="ltr" placeholder="C:\keys\service.json"></td></tr>
+        <tr><td>تبِ محصولات</td><td><input id="dTab" placeholder="محصولات"></td></tr>
+        <tr><td>تبِ لیست‌ها</td><td><input id="dListsTab" placeholder="لیست‌ها"></td></tr>
+        <tr><td>تبِ گزارش</td><td><input id="dReportTab" placeholder="گزارش تکمیل"></td></tr>
+        <tr><td>سطر عنوان ستون‌ها</td><td><input id="dHeaderRow" type="number" min="1" value="1"></td></tr>
+        <tr>
+          <td>یا فایل محلی</td>
+          <td><input id="dFile" dir="ltr" placeholder="products.csv یا products.xlsx — بدون حساب گوگل"></td>
+        </tr>
+      </table>
+      <p class="muted">
+        گزینه‌های کرکره‌ای (دسته و تگ و ملیت) از تبِ «لیست‌ها» خوانده می‌شوند: هر ستون
+        یک کرکره، سطر اولش عنوان ستون. این‌طوری هیچ‌وقت مقداری خارج از کرکره‌ی شما
+        در سلول نوشته نمی‌شود.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>۲. قواعد تکمیل</h2>
+      <table class="kv">
+        <tr>
+          <td>سلول‌های پرشده</td>
+          <td>
+            <select id="dOverwrite">
+              <option value="empty">دست نخورند — فقط سلول خالی پر شود</option>
+              <option value="always">بازنویسی شوند</option>
+            </select>
+          </td>
+        </tr>
+        <tr><td>سقف عنوان در هر نشست</td><td><input id="dMaxTitles" type="number" min="0" value="0"></td></tr>
+        <tr><td>سقف کل (۰ = همه)</td><td><input id="dLimit" type="number" min="0" value="0"></td></tr>
+        <tr><td>حداکثر منبع برای هر عنوان</td><td><input id="dMaxSources" type="number" min="1" value="5"></td></tr>
+        <tr><td>هر چند ردیف یک‌بار در شیت نوشته شود</td><td><input id="dBatch" type="number" min="1" value="100"></td></tr>
+        <tr><td>حداکثر دسته / تگ</td><td><input id="dMaxCats" type="number" min="1" value="3"> <input id="dMaxTags" type="number" min="1" value="5"></td></tr>
+        <tr><td>جداکننده‌ی چندانتخابی</td><td><input id="dSeparator" placeholder="، " style="max-width:8rem"></td></tr>
+        <tr>
+          <td>تصویر</td>
+          <td>
+            <label><input id="dImageEnabled" type="checkbox" checked> جمع‌آوری لینک کاور مربع</label>
+            حداقل ضلع: <input id="dImageMinSide" type="number" min="0" value="400">
+          </td>
+        </tr>
+      </table>
+      <div class="row wrap">
+        <button id="dSaveBtn" class="primary">ذخیره‌ی تنظیمات</button>
+        <button id="dRunBtn">اجرای فاز ۵</button>
+        <button id="dResetBtn" class="ghost danger" title="همه‌ی ردیف‌ها دوباره در صف تکمیل">صف را از نو بساز</button>
+        <span class="spacer"></span>
+        <span class="muted" id="dStatus"></span>
+      </div>
+      <p class="warn">
+        ستون‌های <b>Status</b> و <b>Product ID</b> هیچ‌وقت نوشته نمی‌شوند؛ آن‌ها را
+        اسکریپت درج محصول پر می‌کند.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>۳. وضعیت ردیف‌ها</h2>
+      <div class="cards" id="dCounters"></div>
+      <div class="scrollbox">
+        <table class="grid" id="dTable">
+          <thead>
+            <tr>
+              <th style="width:3rem">ردیف</th>
+              <th>عنوان</th>
+              <th style="width:10rem">کلمه کلیدی</th>
+              <th style="width:8rem">نویسنده</th>
+              <th style="width:4rem">صفحات</th>
+              <th style="width:9rem">دسته</th>
+              <th style="width:5rem">تصویر</th>
+              <th style="width:6rem">وضعیت</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted">
+        ۵۰ ردیف اول نمایش داده می‌شود. «ناقص» یعنی برای بعضی ستون‌ها شاهدی پیدا نشد —
+        دلیلش در تبِ گزارشِ خود شیت نوشته شده است.
+      </p>
     </div>
   </section>
 

@@ -315,6 +315,76 @@ def extract_links(page_html: str, base_url: str) -> list[str]:
     return out
 
 
+class _AnchorParser(HTMLParser):
+    """لینک‌ها همراه با متن خودشان (برای تطبیق نتایج جستجوی سایت)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.anchors: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        mapping = {name: (value or "") for name, value in attrs}
+        href = mapping.get("href", "")
+        if not href:
+            return
+        self._flush()
+        self._href = href
+        # عنوان محصول در بعضی قالب‌ها فقط در ``title``/``aria-label`` است
+        self._text = [mapping.get("title", ""), mapping.get("aria-label", "")]
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._href is not None:
+            text = _WS_RE.sub(" ", " ".join(t for t in self._text if t)).strip()
+            self.anchors.append((self._href, text))
+        self._href = None
+        self._text = []
+
+    def close(self) -> None:  # pragma: no cover - مسیر HTML بدون تگ بسته
+        self._flush()
+        super().close()
+
+
+def extract_anchors(page_html: str, base_url: str) -> list[tuple[str, str]]:
+    """``(آدرس مطلق، متن لینک)`` — بدون تکرار، اولین متنِ غیرخالی می‌ماند.
+
+    صفحه‌ی نتایج جستجوی یک فروشگاه ده‌ها لینک دارد؛ با متن لینک می‌فهمیم کدام
+    همان عنوانی است که دنبالش هستیم، بدون اینکه همه‌ی صفحه‌ها را دانلود کنیم.
+    """
+    parser = _AnchorParser()
+    try:
+        parser.feed(page_html)
+        parser.close()
+    except Exception:  # pragma: no cover - HTML خراب
+        pass
+    out: list[tuple[str, str]] = []
+    seen: dict[str, int] = {}
+    for href, text in parser.anchors:
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        absolute, _ = urllib.parse.urldefrag(urllib.parse.urljoin(base_url, href))
+        absolute = absolute.rstrip("/") or absolute
+        if absolute in seen:
+            index = seen[absolute]
+            if not out[index][1] and text:
+                out[index] = (absolute, text)
+            continue
+        seen[absolute] = len(out)
+        out.append((absolute, text))
+    return out
+
+
 def same_domain(url: str, domain: str) -> bool:
     netloc = urllib.parse.urlsplit(url).netloc.lower()
     domain = domain.lower()
@@ -429,3 +499,50 @@ def extract_images(page_html: str, base_url: str) -> list[str]:
     for match in re.finditer(r"<img[^>]+src=[\"']([^\"']+)[\"']", page_html, re.I):
         urls.append(urllib.parse.urljoin(base_url, match.group(1)))
     return urls
+
+
+# ---------------------------------------------------------------------------
+# JSON-LD
+# ---------------------------------------------------------------------------
+
+_JSONLD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I
+)
+
+
+def json_ld_blocks(page_html: str) -> list[dict]:
+    """همه‌ی اشیای JSON-LD صفحه، تخت‌شده.
+
+    فروشگاه‌های وردپرسی معمولاً ``@graph`` می‌دهند و داده‌ی مفید (نویسنده،
+    تعداد صفحات، توضیحات، تصویر) داخل یکی از گره‌های آن است. اینجا همه‌ی
+    دیکشنری‌های تودرتو بیرون کشیده می‌شوند تا بعداً فقط دنبال کلیدها بگردیم.
+    """
+    import json as _json
+
+    out: list[dict] = []
+
+    def walk(node: object, depth: int = 0) -> None:
+        if depth > 6 or len(out) > 200:
+            return
+        if isinstance(node, dict):
+            out.append(node)
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1)
+
+    for match in _JSONLD_RE.finditer(page_html or ""):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        try:
+            walk(_json.loads(raw))
+        except ValueError:
+            # بعضی قالب‌ها چند شیء را پشت‌سرهم و بدون آرایه می‌گذارند
+            for chunk in re.findall(r"\{.*?\}(?=\s*[\{\[]|\s*$)", raw, re.S):
+                try:
+                    walk(_json.loads(chunk))
+                except ValueError:
+                    continue
+    return out

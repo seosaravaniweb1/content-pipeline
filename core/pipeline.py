@@ -16,7 +16,7 @@ from .embeddings import TopicMatcher, get_encoder
 from .http import fetcher_from_config
 from .suggest import suggest_from_config
 from ..output import exporter
-from ..phases import p1_crawl, p2_resolve, p3_suggest
+from ..phases import p1_crawl, p2_resolve, p3_suggest, p5_details
 
 LogFn = Callable[[str], None]
 
@@ -25,8 +25,13 @@ PHASE_NAMES: dict[int, str] = {
     2: "Entity Resolution",
     3: "گوگل ساجست",
     4: "خروجی",
+    5: "تکمیل دیتیل محصولات",
 }
+#: آخرین فاز زنجیره‌ی پیش‌فرض ``start``. فاز ۵ عمداً بیرون از آن است: تا وقتی
+#: گوگل‌شیت محصولات تنظیم نشده باشد کاری برای انجام دادن ندارد.
 LAST_PHASE = 4
+#: بزرگ‌ترین شماره‌ی فاز قابل اجرا (با ``phase 5`` یا از تب پنل)
+MAX_PHASE = 5
 
 
 def topic_matcher(
@@ -108,6 +113,20 @@ def run_phase(
     elif phase == 4:
         summary = exporter.run(conn, run_id, config).render()
 
+    elif phase == 5:
+        options = p5_details.options_from_config(config, db.get_setting(conn, "details", {}))
+        if not (options.sheet.sheet_id or options.sheet.file):
+            # این فاز در زنجیره‌ی پیش‌فرض هست ولی ورودی‌اش اختیاری است؛ نبودنش
+            # خطا نیست، فقط یعنی هنوز شیتی برای پر کردن معرفی نشده.
+            return (
+                "فاز ۵ رد شد — هنوز گوگل‌شیت محصولات (یا فایل ورودی) تنظیم نشده است.\n"
+                "  از تب «تکمیل دیتیل» پنل شناسه‌ی شیت و فایل service account را بدهید."
+            )
+        with fetcher_from_config(config) as fetcher:
+            summary = p5_details.run(
+                conn, run_id, config, fetcher, options, log=log, should_stop=should_stop
+            ).render()
+
     else:
         raise ValueError(f"شماره فاز نامعتبر: {phase}")
 
@@ -131,6 +150,12 @@ def counters(conn: sqlite3.Connection, run_id: str) -> dict[str, int]:
         "keywords": (
             "SELECT COUNT(*) c FROM lsi_keywords k JOIN canonical_products p"
             " ON p.id=k.canonical_id WHERE p.run_id=?"
+        ),
+        "detail_rows": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=?",
+        "detail_done": "SELECT COUNT(*) c FROM detail_rows WHERE run_id=? AND status='done'",
+        "detail_pending": (
+            "SELECT COUNT(*) c FROM detail_rows WHERE run_id=?"
+            " AND (status IS NULL OR status IN ('pending','partial'))"
         ),
     }
     return {

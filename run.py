@@ -41,9 +41,10 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):  # pragma: no cover — استریم غیرعادی
         pass
 
-from .core import db, normalizer, pipeline
+from .core import db, gsheet, http, normalizer, pipeline
 from .core.config import Config, ConfigError, load_config
 from .output import exporter
+from .phases import p5_details
 
 app = typer.Typer(
     add_completion=False,
@@ -52,6 +53,7 @@ app = typer.Typer(
 
 PHASE_NAMES = pipeline.PHASE_NAMES
 LAST_PHASE = pipeline.LAST_PHASE
+MAX_PHASE = pipeline.MAX_PHASE
 
 
 @dataclass
@@ -74,7 +76,13 @@ def _open(
     topic: Optional[str] = None,
     run_id: Optional[str] = None,
     create: bool = True,
+    allow_new: bool = False,
 ) -> Context:
+    """باز کردن config و دیتابیس و انتخاب اجرا.
+
+    ``allow_new`` برای دستورهایی است که به کراول قبلی نیاز ندارند (مثل
+    ``details``): اگر هیچ اجرایی نبود، به‌جای خطا یک اجرای تازه ساخته می‌شود.
+    """
     try:
         config = load_config(config_path)
     except ConfigError as exc:
@@ -95,6 +103,9 @@ def _open(
         resolved = db.create_run(conn, target_topic)
     else:
         row = db.latest_run(conn, target_topic or None)
+        if row is None and allow_new:
+            resolved = db.create_run(conn, target_topic or "محصولات")
+            return Context(config=config, conn=conn, run_id=resolved)
         if row is None:
             _fail("هیچ اجرای قبلی پیدا نشد. اول `start` را اجرا کنید یا --run-id بدهید.")
         resolved = row["run_id"]
@@ -139,8 +150,8 @@ def start(
     config: Optional[str] = typer.Option(None, "--config", "-c", help="مسیر config.yaml"),
     topic: Optional[str] = typer.Option(None, "--topic", "-t", help="موضوع هدف"),
     run_id: Optional[str] = typer.Option(None, "--run-id", help="ادامه‌ی یک اجرای موجود"),
-    resume_from: int = typer.Option(1, "--resume-from", min=1, max=LAST_PHASE),
-    until: int = typer.Option(LAST_PHASE, "--until", min=1, max=LAST_PHASE),
+    resume_from: int = typer.Option(1, "--resume-from", min=1, max=MAX_PHASE),
+    until: int = typer.Option(LAST_PHASE, "--until", min=1, max=MAX_PHASE),
     phases: Optional[str] = typer.Option(None, "--phases", help="فهرست دلخواه، مثل 1,2"),
 ) -> None:
     """اجرای پایپ‌لاین. فازها مستقل‌اند و از طریق دیتابیس با هم حرف می‌زنند."""
@@ -174,7 +185,7 @@ def start(
 
 @app.command("phase")
 def phase_command(
-    number: int = typer.Argument(..., min=1, max=LAST_PHASE),
+    number: int = typer.Argument(..., min=1, max=MAX_PHASE),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     run_id: Optional[str] = typer.Option(None, "--run-id"),
 ) -> None:
@@ -202,6 +213,76 @@ def export_command(
     context.close()
 
 
+@app.command("details")
+def details_command(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    run_id: Optional[str] = typer.Option(None, "--run-id"),
+    sheet_id: Optional[str] = typer.Option(None, "--sheet-id", help="شناسه‌ی گوگل‌شیت محصولات"),
+    service_account: Optional[str] = typer.Option(
+        None, "--service-account", help="مسیر فایل json سرویس‌اکانت گوگل"
+    ),
+    tab: Optional[str] = typer.Option(None, "--tab", help="نام تبِ محصولات"),
+    file: Optional[str] = typer.Option(
+        None, "--file", help="به‌جای گوگل‌شیت، یک csv/xlsx محلی پر شود"
+    ),
+    limit: int = typer.Option(0, "--limit", help="فقط این تعداد عنوان (۰ = همه)"),
+    overwrite: str = typer.Option(
+        "empty", "--overwrite", help="empty = فقط سلول خالی، always = بازنویسی"
+    ),
+    save: bool = typer.Option(
+        False, "--save", help="این تنظیمات برای اجراهای بعدی هم ذخیره شود"
+    ),
+) -> None:
+    """فاز ۵ — پر کردن ستون‌های گوگل‌شیت محصولات (نویسنده، خلاصه، تگ، ...)."""
+    # این دستور به کراول قبلی وابسته نیست؛ اگر اجرایی نبود، خودش یکی می‌سازد.
+    context = _open(config, run_id=run_id, create=False, allow_new=True)
+    overrides = {
+        key: value
+        for key, value in (
+            ("sheet_id", sheet_id),
+            ("service_account_json", service_account),
+            ("tab", tab),
+            ("file", file),
+            ("limit", limit or None),
+            ("overwrite", overwrite),
+        )
+        if value not in (None, "")
+    }
+    stored = db.get_setting(context.conn, "details", {}) or {}
+    merged = {**stored, **overrides}
+    if save and overrides:
+        db.set_setting(context.conn, "details", merged)
+        typer.secho("تنظیمات ذخیره شد.", fg=typer.colors.BRIGHT_BLACK)
+
+    typer.secho(f"run_id: {context.run_id}", fg=typer.colors.BRIGHT_BLACK)
+    options = p5_details.options_from_config(context.config, merged)
+    if not (options.sheet.sheet_id or options.sheet.file):
+        context.close()
+        _fail(
+            "نه شناسه‌ی گوگل‌شیت داده شده و نه فایل ورودی.\n"
+            "  نمونه: python -m content_pipeline.run details -c config.yaml"
+            " --sheet-id 1AbC... --service-account service.json"
+        )
+        return
+    try:
+        with http.fetcher_from_config(context.config) as fetcher:
+            stats = p5_details.run(
+                context.conn,
+                context.run_id,
+                context.config,
+                fetcher,
+                options,
+                log=lambda line: typer.echo(f"  {line}"),
+            )
+        typer.echo(stats.render())
+    except gsheet.SheetError as exc:
+        context.close()
+        _fail(str(exc))
+        return
+    finally:
+        context.close()
+
+
 @app.command("status")
 def status_command(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
@@ -226,6 +307,9 @@ def status_command(
         "no_suggest": "no_suggest",
         "pending_suggest": "در صف ساجست",
         "keywords": "کلمه‌ی کلیدی",
+        "detail_rows": "ردیف شیت محصولات",
+        "detail_done": "دیتیل کامل",
+        "detail_pending": "در صف تکمیل دیتیل",
     }
     counts = pipeline.counters(conn, rid)
     for key, label in labels.items():

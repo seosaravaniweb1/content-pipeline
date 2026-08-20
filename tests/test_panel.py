@@ -43,7 +43,9 @@ def panel(tmp_path):
     thread.start()
     port = httpd.server_address[1]
 
-    def call(path, method="GET", body=None, token="tok", headers=None):
+    def call(path, method="GET", body=None, token="tok", headers=None, params=None):
+        if params:
+            path = f"{path}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}{path}",
             method=method,
@@ -569,8 +571,9 @@ def test_plan_is_locked_while_a_job_runs(panel, monkeypatch):
 def test_sheet_choices_are_listed_with_hints(panel):
     _, data = panel("/api/sheets")
     keys = [sheet["key"] for sheet in data["sheets"]]
-    assert keys == ["ready", "archive", "all", "review"]
-    assert set(data["selected"]) == set(keys)
+    assert keys == ["ready", "archive", "all", "review", "products"]
+    # «محصولات (دیتیل)» خروجی فاز ۵ است و پیش‌فرض تیک نمی‌خورد
+    assert set(data["selected"]) == {"ready", "archive", "all", "review"}
     combined = next(sheet for sheet in data["sheets"] if sheet["key"] == "all")
     assert "ساجست" in combined["hint"]
 
@@ -587,3 +590,57 @@ def test_empty_output_selection_is_refused(panel):
     status, payload = panel("/api/sheets", method="POST", body={"sheets": []})
     assert status == 400
     assert "حداقل" in payload["error"]
+
+
+# --------------------------------------------------- تب «تکمیل دیتیل»
+
+
+def test_detail_settings_start_empty_and_are_saved(panel):
+    _, data = panel("/api/details")
+    assert data["ready"] is False  # هنوز نه شیتی داده شده نه فایلی
+    assert "status" in data["never_write"] and "product_id" in data["never_write"]
+
+    status, saved = panel(
+        "/api/details",
+        method="POST",
+        body={"file": "products.csv", "max_sources_per_title": 3, "overwrite": "always"},
+    )
+    assert status == 200
+    assert saved["ready"] is True
+    assert saved["settings"]["max_sources_per_title"] == 3
+    assert saved["settings"]["overwrite"] == "always"
+
+    _, again = panel("/api/details")
+    assert again["settings"]["file"] == "products.csv"  # در دیتابیس ماندگار است
+
+
+def test_a_sheet_without_a_service_account_is_refused(panel):
+    status, payload = panel("/api/details", method="POST", body={"sheet_id": "1AbC"})
+    assert status == 400
+    assert "سرویس‌اکانت" in payload["error"]
+
+
+def test_phase_five_is_not_ticked_by_default(panel):
+    _, data = panel("/api/state")
+    phases = {phase["n"]: phase for phase in data["phases"]}
+    assert phases[5]["name"] == "تکمیل دیتیل محصولات"
+    assert phases[5]["default"] is False
+    assert phases[4]["default"] is True
+
+
+def test_detail_queue_can_be_reset(panel):
+    run = panel("/api/runs", method="POST", body={"categories": ["رمان"], "sites": "https://a.ir"})
+    run_id = run[1]["run_id"]
+    conn = panel.state.conn()  # type: ignore[attr-defined]
+    with db.transaction(conn):
+        detail_id = db.upsert_detail_row(conn, run_id, "رمان الف", "رمان الف", 2)
+        db.save_detail_values(conn, detail_id, {"author": "آوا"}, status=db.DONE)
+    db.mark_detail_pushed(conn, [detail_id])
+
+    _, data = panel("/api/details", params={"run_id": run_id})
+    assert data["counts"]["done"] == 1 and data["counts"]["pushed"] == 1
+
+    status, payload = panel("/api/details/reset", method="POST", body={"run_id": run_id})
+    assert status == 200 and payload["reset"] == 1
+    _, after = panel("/api/details", params={"run_id": run_id})
+    assert after["counts"]["pending"] == 1 and after["counts"]["pushed"] == 0
