@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -73,7 +74,6 @@ LABELS: dict[str, tuple[str, ...]] = {
         "شمار صفحات",
         "صفحات",
         "صفحه",
-        "حجم کتاب",
         "تعداد برگ",
         "pages",
         "pagecount",
@@ -159,11 +159,29 @@ PDF_HINTS: tuple[str, ...] = _keys("pdf", "پی دی اف", "پیدیاف")
 
 #: نویسنده‌ی نامشخص — نه نام است و نه باید در شیت بنشیند
 UNKNOWN_PERSON: tuple[str, ...] = _keys(
-    "ناشناس", "نامشخص", "بی نام", "بدون نام", "گمنام", "نامعلوم", "anonymous", "unknown", "-"
+    "ناشناس", "نامشخص", "بی نام", "بدون نام", "گمنام", "نامعلوم", "anonymous", "unknown", "-",
+    # «مترجم: ندارد» یعنی مترجم ندارد، نه اینکه مترجمش «ندارد» نام دارد —
+    # و همین اشتباه بود که رمان ایرانی را «خارجی» می‌کرد.
+    "ندارد", "نیست", "فاقد", "بدون مترجم", "مترجم ندارد", "ترجمه نشده", "تالیف",
+    "___", "...", "—", "–", "بدون", "خالی", "none", "n a", "na", "null",
+)
+
+#: نامِ «نویسنده»ای که در واقع مدیرِ سایت است. وردپرس در JSON-LD نویسنده‌ی
+#: *پست* را می‌نویسد، نه نویسنده‌ی کتاب؛ اگر جدی گرفته شود هر رمانی که آن
+#: سایت گذاشته نویسنده‌ی لاتین پیدا می‌کند و «خارجی» علامت می‌خورد.
+SITE_PERSON: tuple[str, ...] = _keys(
+    "admin", "administrator", "root", "user", "editor", "author", "webmaster", "support",
+    "مدیر", "مدیریت", "ادمین", "تحریریه", "سردبیر", "نویسنده", "کاربر", "پشتیبانی",
+    "مدیر سایت", "تیم تحریریه",
 )
 
 MIN_PAGES = 5
 MAX_PAGES = 5000
+
+#: نسخه‌ی قواعدِ استخراج. با هر تغییرِ معنادار در قواعد یکی بالا می‌رود و
+#: کشِ صفحه‌های قدیمی خودبه‌خود بی‌اعتبار می‌شود — وگرنه اجرای بعدی همان
+#: نتیجه‌ی غلطِ قبلی را از کش می‌خواند و انگار هیچ چیزی درست نشده.
+EXTRACT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -420,24 +438,36 @@ _PERSON_SPLIT = re.compile(r"[،,;؛/\\|]|\s+و\s+(?=[^\s]{2,})")
 _PERSON_BAD = re.compile(r"\d|[«»\"'()\[\]{}]|@|https?:")
 
 
-def clean_persons(raw: str, max_names: int = 3) -> list[str]:
+def clean_persons(raw: str, max_names: int = 3, site: str = "") -> list[str]:
     """«نوشته‌ی آوا محمدی، مهسا ک.» → ``['آوا محمدی', 'مهسا ک.']``.
 
-    نام باید نام باشد: بدون رقم، بدون آدرس، حداکثر پنج کلمه. «ناشناس» و
-    هم‌خانواده‌هایش حذف می‌شوند تا در شیت به‌جای نام، «نامشخص» ننشیند.
+    نام باید نام باشد: بدون رقم، بدون آدرس، حداکثر پنج کلمه. «ناشناس»،
+    «ندارد»، نامِ مدیر سایت و خودِ اسم سایت حذف می‌شوند تا در شیت به‌جای نام،
+    چیز دیگری ننشیند — و مهم‌تر: تا «مترجم: ندارد» رمان را خارجی نکند.
+
+    ``site`` کلیدِ نام دامنه است (``roman98``) تا نامی که همان اسم سایت است
+    نویسنده حساب نشود.
     """
     if not raw:
         return []
+    site = label_key(site)
     out: list[str] = []
     for piece in _PERSON_SPLIT.split(normalize_display(raw)):
-        name = _PERSON_TRIM.sub("", piece.strip(" \t.،-–—")).strip()
+        name = _PERSON_TRIM.sub("", piece.strip(" \t.،-–—_")).strip()
         if not name or _PERSON_BAD.search(name):
             continue
-        if label_key(name) in UNKNOWN_PERSON:
+        key = label_key(name)
+        if key in UNKNOWN_PERSON or key in SITE_PERSON:
             continue
+        if key and (key == site or (len(site) >= 4 and site in key)):
+            continue  # «نویسنده» همان اسم سایت است
         words = name.split()
         if not 1 <= len(words) <= 5 or len(name) < 2 or len(name) > 60:
             continue
+        if is_latin_name(name):
+            # نرمال‌سازی همه‌چیز را کوچک می‌کند؛ برای نامِ لاتین شکل درست
+            # «Rina Kent» است نه «rina kent».
+            name = name.title()
         if name not in out:
             out.append(name)
         if len(out) >= max_names:
@@ -449,11 +479,15 @@ _LATIN_LETTERS = re.compile(r"[A-Za-z]")
 
 
 def is_latin_name(name: str) -> bool:
-    """نام لاتین («Rina Kent») — قوی‌ترین نشانه‌ی رمان خارجی."""
+    """نام لاتین («Rina Kent») — قوی‌ترین نشانه‌ی رمان خارجی.
+
+    حداقل سه حرف لاتین لازم است: «A.» یا «PDF» نام لاتین نیست و نباید ملیت
+    یک رمان را عوض کند.
+    """
     letters = [ch for ch in name if ch.isalpha()]
-    if not letters:
-        return False
     latin = sum(1 for ch in letters if _LATIN_LETTERS.match(ch))
+    if latin < 3:
+        return False
     return latin / len(letters) > 0.6
 
 
@@ -461,25 +495,50 @@ def is_latin_name(name: str) -> bool:
 # تعداد صفحات
 # ---------------------------------------------------------------------------
 
-_PAGES_PATTERNS = (
-    re.compile(r"(?:تعداد\s*صفح\S*|شمار\s*صفح\S*)\D{0,12}?(\d{1,4})"),
+#: «تعداد صفحات: ۳۹۸» — عدد کنار برچسبِ صریح. این تنها الگویی است که در متنِ
+#: آزادِ صفحه هم قابل اعتماد است.
+_PAGES_LABELLED = re.compile(r"(?:تعداد\s*صفح\S*|شمار\s*صفح\S*|تعداد\s*برگ)\D{0,12}?(\d{1,4})")
+
+#: «۳۹۸ صفحه» — فقط داخل مقدارِ یک برچسب معتبر است. در متن آزاد، همین الگو
+#: عددِ محصولِ مرتبط، تبلیغ و «بیش از ۵۰۰ صفحه محتوا» را هم برمی‌دارد.
+_PAGES_LOOSE = (
     re.compile(r"(\d{2,4})\s*صفحه"),
     re.compile(r"صفحه\D{0,4}(\d{2,4})"),
 )
 
+#: واحدهایی که یعنی این عدد «حجم فایل» است نه تعداد صفحه
+_SIZE_UNITS = re.compile(
+    r"مگابایت|کیلوبایت|گیگابایت|مگ\b|\bmb\b|\bkb\b|\bgb\b|بایت|دقیقه|ساعت|تومان|ریال", re.I
+)
 
-def page_numbers(text: str) -> list[int]:
-    """همه‌ی عددهایی که در این متن معنای «تعداد صفحات» دارند."""
+#: بازه‌ی سالِ شمسی و میلادی — «چاپ ۱۴۰۲» تعداد صفحه نیست
+_YEARS = frozenset([*range(1300, 1500), *range(1900, 2100)])
+
+
+def page_numbers(text: str, strict: bool = False) -> list[int]:
+    """همه‌ی عددهایی که در این متن معنای «تعداد صفحات» دارند.
+
+    ``strict`` یعنی فقط عددی که کنار برچسبِ صریح «تعداد صفحات» آمده پذیرفته
+    شود. برای متنِ آزادِ صفحه همیشه باید ``strict`` باشد: بدون آن، «۳۲۰ صفحه»‌ی
+    یک محصولِ مرتبط در ستون تعداد صفحاتِ این محصول می‌نشیند — دقیقاً همان
+    عددی که در هیچ منبعی نبود.
+    """
     latin = latin_digits(text or "")
+    if _SIZE_UNITS.search(latin):
+        return []
+    patterns = (_PAGES_LABELLED,) if strict else (_PAGES_LABELLED, *_PAGES_LOOSE)
     out: list[int] = []
-    for pattern in _PAGES_PATTERNS:
+    for pattern in patterns:
         for match in pattern.finditer(latin):
             try:
                 value = int(match.group(1))
             except ValueError:  # pragma: no cover - گروه همیشه رقم است
                 continue
-            if MIN_PAGES <= value <= MAX_PAGES and value not in out:
-                out.append(value)
+            if not MIN_PAGES <= value <= MAX_PAGES or value in out:
+                continue
+            if pattern is not _PAGES_LABELLED and value in _YEARS:
+                continue  # «چاپ ۱۴۰۲» یا «۲۰۱۹» تعداد صفحه نیست
+            out.append(value)
     return out
 
 
@@ -560,8 +619,81 @@ def _summary_sections(page_html: str, window: int = 9000) -> list[str]:
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!؟?…])\s+|\n+")
 
 
+#: هشتگ — چه فارسی چه لاتین. سایت‌هایی که سئو را رعایت نکرده‌اند ته خلاصه
+#: ردیفی هشتگ می‌چسبانند و آن ردیف عیناً در ستون خلاصه می‌نشیند.
+_HASHTAG = re.compile(r"[#＃][^\s#،,.!?؟＃]{2,}")
+#: آدرس، ایمیل و آی‌دی — هیچ‌کدام جزو خلاصه‌ی داستان نیستند
+_CONTACT = re.compile(r"https?://\S+|www\.\S+|\S+@\S+\.\S+|(?<![\w])@[A-Za-z0-9_]{3,}")
+#: جداکننده‌های فهرستِ کلمه‌ی کلیدی: «رمان عاشقانه | دانلود رمان | رمان جدید»
+_LIST_SPLIT = re.compile(r"[|•·▪●\-–—/]{1,}|،|,")
+
+
+def strip_seo_noise(text: str) -> str:
+    """هشتگ، لینک و آی‌دی را از متن بیرون بکش.
+
+    خودِ جمله دور ریخته نمی‌شود: خیلی وقت‌ها جمله‌ی سالمی است که آخرش هشتگ
+    چسبانده‌اند. اگر بعد از پاک‌سازی چیزی نماند، بالادست خودش ردش می‌کند.
+    """
+    text = _HASHTAG.sub(" ", text or "")
+    text = _CONTACT.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" \t«»\"'-–—|،,:")
+
+
+#: تکه کردنِ متن به کلمه — بدون حذف فاصله (بر خلاف ``label_key``)
+_WORD_SPLIT = re.compile(r"[^\w\u200c]+", re.UNICODE)
+
+#: نشانه‌های فعلِ فارسی، در سطحِ **کلمه**. خلاصه‌ی داستان جمله است و جمله فعل
+#: دارد؛ فهرستِ کلمه‌ی کلیدی ندارد. الگو عمداً سخت‌گیر نیست: فعلِ اضافی فقط
+#: یعنی جمله نگه داشته می‌شود، ولی فعلِ جاافتاده یعنی جمله‌ی سالم دور ریخته
+#: می‌شود — و آن بدتر است.
+_VERB_WORDS = frozenset(
+    """است هست نیست بود بودند شد شدند شده میشود نمیشود دارد ندارد داشت داشتند
+    کرد کردند کند کنند گفت گفتند رفت رفتند آمد آمدند شود باشد بماند ماند گرفت
+    گیرد دید دیدند خواهد خواست یافت داد دهد میکند میکنند میشد نبود تنهاست""".split()
+)
+_VERB_SHAPE = re.compile(r"^(?:می|نمی)\w{2,}$|\w{3,}(?:ید|یم|ند|تند|دند|اند|ست|شد|بود)$")
+
+
+def _words(text: str) -> list[str]:
+    plain = normalize_display(text or "").replace(ZWNJ, "").lower()
+    return [word for word in _WORD_SPLIT.split(plain) if len(word) > 1]
+
+
+def has_verb(text: str) -> bool:
+    """آیا این متن جمله است یا فهرست؟"""
+    return any(word in _VERB_WORDS or _VERB_SHAPE.match(word) for word in _words(text))
+
+
+def is_keyword_stuffing(text: str) -> bool:
+    """آیا این «جمله» در واقع فهرستِ کلمه‌ی کلیدی است؟
+
+    سه نشانه، هر کدام به‌تنهایی کافی: تکرارِ بیش از حدِ یک کلمه، فهرستِ
+    چندتکه‌ایِ عبارت‌های کوتاه، و نبودِ هیچ فعلی در متنی که ادعا می‌کند
+    خلاصه‌ی داستان است.
+    """
+    words = _words(text)
+    if len(words) < 4:
+        return True
+    counts = Counter(words)
+    _, repeats = counts.most_common(1)[0]
+    if repeats >= 3 and repeats / len(words) >= 0.25:
+        return True  # «رمان ... رمان ... رمان»
+    if len(words) >= 8 and len(counts) / len(words) < 0.55:
+        return True  # نصفِ کلمه‌ها تکراری‌اند
+    pieces = [piece.strip() for piece in _LIST_SPLIT.split(text) if piece.strip()]
+    if len(pieces) >= 4 and sum(len(p.split()) for p in pieces) / len(pieces) <= 4:
+        return True  # «دانلود رمان x | رمان عاشقانه | pdf رمان»
+    if len(words) < 10:
+        # عبارتِ کوتاهِ بی‌فعل، تیتر یا کلمه‌ی کلیدی است نه جمله. متنِ بلندِ
+        # بی‌فعل ممکن است توضیحِ درستِ یک جزوه یا نمونه‌سوال باشد، پس دست
+        # نمی‌خورد — این اسکریپت فقط برای رمان نیست.
+        return not has_verb(text)
+    return False
+
+
 def _clean_sentence(text: str) -> str:
     text = extract.strip_tags(text or "").strip()
+    text = strip_seo_noise(text)
     return re.sub(r"\s{2,}", " ", text).strip(" \t«»\"'-–—")
 
 
@@ -742,17 +874,43 @@ def _int(value: object) -> int:
 
 _PERSON_KEYS = {"author": "authors", "translator": "translators", "creator": "authors"}
 
+#: فقط این نوع‌ها درباره‌ی *خودِ اثر* حرف می‌زنند. ``Article`` و
+#: ``BlogPosting`` و ``WebPage`` نویسنده‌ی **پست** را می‌نویسند — یعنی مدیر
+#: سایت — و اگر نویسنده‌ی کتاب حساب شوند، هر رمانی که آن سایت گذاشته
+#: «نویسنده‌ی لاتین» پیدا می‌کند و ملیتش خارجی زده می‌شود.
+WORK_TYPES: tuple[str, ...] = (
+    "book", "product", "creativework", "ebook", "audiobook", "movie", "course",
+    "publicationvolume", "productmodel", "individualproduct",
+)
 
-def _json_ld_people(node: dict) -> dict[str, list[str]]:
+
+def _node_types(node: dict) -> list[str]:
+    value = node.get("@type") or node.get("type") or ""
+    items = value if isinstance(value, list) else [value]
+    return [str(item).strip().lower().replace(" ", "") for item in items if item]
+
+
+def is_work_node(node: dict) -> bool:
+    """آیا این بلوکِ JSON-LD درباره‌ی خودِ محصول است یا درباره‌ی صفحه؟"""
+    types = _node_types(node)
+    if not types:
+        # بلوک بی‌نوع فقط وقتی معتبر است که مشخصه‌ی خودِ کتاب را داشته باشد
+        return any(key in node for key in ("isbn", "numberOfPages", "bookFormat"))
+    return any(any(known in name for known in WORK_TYPES) for name in types)
+
+
+def _json_ld_people(node: dict, site: str = "") -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
+    if not is_work_node(node):
+        return out
     for key, target in _PERSON_KEYS.items():
         value = node.get(key)
         names: list[str] = []
         for item in value if isinstance(value, list) else [value]:
             if isinstance(item, str):
-                names.extend(clean_persons(item))
+                names.extend(clean_persons(item, site=site))
             elif isinstance(item, dict):
-                names.extend(clean_persons(str(item.get("name") or "")))
+                names.extend(clean_persons(str(item.get("name") or ""), site=site))
         if names:
             out.setdefault(target, []).extend(names)
     return out
@@ -787,18 +945,28 @@ def extract_details(
         name: values_for(details.labeled, aliases) for name, aliases in LABELS.items()
     }
     blocks = extract.json_ld_blocks(page_html)
+    site = re.sub(r"^www\.|\.[a-z.]+$", "", domain)
 
     # -- اشخاص --------------------------------------------------------------
     for node in blocks:
-        for target, names in _json_ld_people(node).items():
+        for target, names in _json_ld_people(node, site=site).items():
             _extend(getattr(details, target), names)
     for value in labeled.get("author", []):
-        _extend(details.authors, clean_persons(value))
+        _extend(details.authors, clean_persons(value, site=site))
     for value in labeled.get("translator", []):
-        _extend(details.translators, clean_persons(value))
+        _extend(details.translators, clean_persons(value, site=site))
+    # مترجمی که همان نویسنده است، ستون تکراریِ قالبِ سایت است نه مترجمِ واقعی
+    details.translators = [
+        name for name in details.translators if label_key(name) not in
+        {label_key(author) for author in details.authors}
+    ]
 
     # -- تعداد صفحات ---------------------------------------------------------
+    # ترتیب، ترتیبِ اعتماد است: JSON-LDِ خودِ کتاب → جدول مشخصات → متن آزاد.
+    # `page_counts[0]` رأی این منبع است، پس معتبرترین شاهد باید اول بیاید.
     for node in blocks:
+        if not is_work_node(node):
+            continue
         for key in ("numberOfPages", "numberofpages", "pageCount"):
             value = _int(node.get(key))
             if MIN_PAGES <= value <= MAX_PAGES:
@@ -806,10 +974,12 @@ def extract_details(
     for value in labeled.get("pages", []):
         _extend(details.page_counts, page_numbers(value) or page_numbers(f"صفحه {value}"))
     if not details.page_counts:
-        # جدول مشخصات نداشت؛ در متن صفحه بگرد («کتابی ۳۹۸ صفحه‌ای»)
+        # جدول مشخصات نداشت؛ فقط دنبال برچسبِ صریح در متن بگرد. الگوی آزادِ
+        # «۳۲۰ صفحه» اینجا استفاده نمی‌شود چون همان‌قدر که عددِ این محصول را
+        # می‌گیرد، عددِ محصولِ مرتبط و متنِ تبلیغ را هم می‌گیرد.
         for line in lines:
-            if len(line) <= 160:
-                _extend(details.page_counts, page_numbers(line))
+            if len(line) <= 200:
+                _extend(details.page_counts, page_numbers(line, strict=True))
             if details.page_counts:
                 break
 
@@ -862,26 +1032,64 @@ def _formats(details: PageDetails, labeled: dict[str, list[str]]) -> list[str]:
     return formats
 
 
-def _nationality(details: PageDetails, labeled: dict[str, list[str]]) -> str:
-    """``foreign`` / ``iranian`` / خالی.
+#: کلمه‌هایی که یک «تگ» را به تگِ ملیت تبدیل می‌کنند. تگی مثل «ترجمه‌ی
+#: اختصاصی» یا «مترجم همراه» درباره‌ی ملیتِ اثر حرف نمی‌زند.
+_NATIONALITY_TERMS: dict[str, str] = {
+    "خارجی": "foreign",
+    "رمان خارجی": "foreign",
+    "رمان های خارجی": "foreign",
+    "ترجمه": "foreign",
+    "رمان ترجمه": "foreign",
+    "رمان ترجمه شده": "foreign",
+    "رمان های ترجمه شده": "foreign",
+    "کتاب ترجمه": "foreign",
+    "foreign": "foreign",
+    "translated": "foreign",
+    "ایرانی": "iranian",
+    "رمان ایرانی": "iranian",
+    "رمان های ایرانی": "iranian",
+    "نویسنده ایرانی": "iranian",
+    "تالیفی": "iranian",
+    "iranian": "iranian",
+}
+_NATIONALITY_BY_KEY = {label_key(term): value for term, value in _NATIONALITY_TERMS.items()}
 
-    ترتیب شواهد: برچسب صریح «ملیت» → وجود مترجم → لاتین بودن نام نویسنده →
-    تگ/دسته‌ی «ایرانی»/«ترجمه». اگر هیچ‌کدام نبود خالی می‌ماند؛ حدس زدن ملیت
-    یعنی نوشتن مقدار غلط در شیت.
+
+def nationality_of_term(term: str) -> str:
+    """تگ/دسته → ``foreign`` / ``iranian`` / خالی — با تطبیقِ **کامل**.
+
+    تطبیق زیررشته‌ای اینجا خطرناک است: «ترجمه» داخل ده‌ها عبارتِ بی‌ربط پیدا
+    می‌شود و رمانِ ایرانی را خارجی می‌کند.
+    """
+    return _NATIONALITY_BY_KEY.get(label_key(term), "")
+
+
+def _nationality(details: PageDetails, labeled: dict[str, list[str]]) -> str:
+    """ملیت این صفحه، همراه با **قدرتِ شاهد**: ``label:iranian``، ``sign:foreign``،
+    ``term:iranian`` یا خالی.
+
+    قدرت شاهد در ادغام لازم است: برچسب صریحِ «ملیت» باید بر تگِ سایدبار
+    بچربد، وگرنه فهرستِ دسته‌بندی‌های سایت — که در هر صفحه‌ای «رمان ترجمه»
+    دارد — ملیتِ همه‌ی رمان‌ها را خارجی می‌کند.
     """
     for value in labeled.get("nationality", []):
         key = label_key(value)
         if any(hint in key for hint in FOREIGN_HINTS):
-            return "foreign"
+            return "label:foreign"
         if any(hint in key for hint in IRANIAN_HINTS):
-            return "iranian"
+            return "label:iranian"
     if details.translators:
-        return "foreign"
+        return "sign:foreign"
     if any(is_latin_name(name) for name in details.authors):
-        return "foreign"
-    terms = [label_key(term) for term in (*details.tags, *details.categories)]
-    if any(any(hint in term for hint in FOREIGN_HINTS) for term in terms):
-        return "foreign"
-    if any(any(hint in term for hint in IRANIAN_HINTS) for term in terms):
-        return "iranian"
+        return "sign:foreign"
+
+    votes = {
+        nationality_of_term(term)
+        for term in (*details.tags, *details.categories)
+        if nationality_of_term(term)
+    }
+    if len(votes) == 1:
+        return "term:" + votes.pop()
+    # هم «ایرانی» و هم «ترجمه» در تگ‌ها هست: این فهرستِ دسته‌بندیِ سایت است،
+    # نه دسته‌ی این محصول. چیزی نمی‌گوییم بهتر از چیزِ غلط گفتن است.
     return ""

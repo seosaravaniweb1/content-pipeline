@@ -144,7 +144,124 @@ def test_unknown_author_is_not_written_as_a_name():
 def test_translator_and_latin_name_mark_the_book_as_foreign():
     page = details.extract_details(PAGE_FOREIGN, "https://a.ir/p/khoda")
     assert page.translators == ["مریم مفتاحی"]
-    assert page.nationality == "foreign"
+    assert page.nationality == "sign:foreign"
+
+
+# ---------------------------------------------------------------------------
+# دقتِ ملیت — «رمان ایرانی» نباید خارجی زده شود
+# ---------------------------------------------------------------------------
+
+
+def test_a_translator_cell_that_says_none_is_not_a_translator():
+    page = details.extract_details(
+        "<table><tr><th>نویسنده</th><td>آوا محمدی</td></tr>"
+        "<tr><th>مترجم</th><td>ندارد</td></tr></table>",
+        "https://a.ir/p/1",
+    )
+    assert page.translators == []
+    assert page.nationality != "sign:foreign"
+
+
+def test_the_wordpress_post_author_is_not_the_book_author():
+    """نویسنده‌ی JSON-LDِ یک ``Article`` مدیرِ سایت است، نه نویسنده‌ی کتاب."""
+    page = details.extract_details(
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"Article","author":{"@type":"Person","name":"Roman98 Admin"}}'
+        "</script></head><body><table><tr><th>نویسنده</th><td>سارا احمدی</td></tr>"
+        "</table></body></html>",
+        "https://roman98.ir/p/1",
+    )
+    assert page.authors == ["سارا احمدی"]
+    assert page.nationality != "sign:foreign"
+
+
+def test_a_book_node_in_json_ld_is_still_trusted():
+    page = details.extract_details(
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"Book","author":{"@type":"Person","name":"Rina Kent"},'
+        '"numberOfPages":352}'
+        "</script></head><body></body></html>",
+        "https://a.ir/p/1",
+    )
+    assert page.authors == ["Rina Kent"]
+    assert page.page_counts == [352]
+    assert page.nationality == "sign:foreign"
+
+
+def test_a_sidebar_full_of_categories_decides_nothing():
+    """سایدباری که هم «رمان ایرانی» دارد هم «رمان ترجمه» یعنی فهرستِ سایت."""
+    page = details.extract_details(
+        '<html><body><a href="/product-category/irani/">رمان ایرانی</a>'
+        '<a href="/product-category/tarjome/">رمان ترجمه</a></body></html>',
+        "https://a.ir/p/1",
+    )
+    assert page.nationality == ""
+
+
+def test_a_tag_that_merely_contains_the_word_translation_is_not_nationality():
+    assert details.nationality_of_term("ترجمه اختصاصی سایت") == ""
+    assert details.nationality_of_term("رمان ترجمه") == "foreign"
+    assert details.nationality_of_term("رمان ایرانی") == "iranian"
+
+
+# ---------------------------------------------------------------------------
+# دقتِ تعداد صفحات
+# ---------------------------------------------------------------------------
+
+
+def test_a_page_count_is_not_invented_from_loose_text():
+    page = details.extract_details(
+        "<html><body><h1>رمان تاوان خیانت</h1>"
+        "<p>در این سایت بیش از 320 صفحه محتوای رایگان داریم.</p></body></html>",
+        "https://a.ir/p/1",
+    )
+    assert page.page_counts == []
+
+
+def test_an_explicit_page_label_in_free_text_is_still_used():
+    page = details.extract_details(
+        "<html><body><p>تعداد صفحات کتاب 398 است.</p></body></html>", "https://a.ir/p/1"
+    )
+    assert page.page_counts == [398]
+
+
+def test_file_size_is_never_read_as_a_page_count():
+    page = details.extract_details(
+        "<table><tr><th>حجم کتاب</th><td>12 مگابایت</td></tr></table>", "https://a.ir/p/1"
+    )
+    assert page.page_counts == []
+
+
+def test_a_print_year_is_not_a_page_count():
+    assert details.page_numbers("چاپ 1402 صفحه") == []
+    assert details.page_numbers("تعداد صفحات: 1402") == [1402]  # برچسب صریح، حرفی نیست
+
+
+# ---------------------------------------------------------------------------
+# پاکسازیِ خلاصه
+# ---------------------------------------------------------------------------
+
+
+def test_hashtags_and_links_are_stripped_from_a_summary_sentence():
+    text = details.strip_seo_noise(
+        "آوا شهر را ترک کرد. #رمان_عاشقانه #دانلود_رمان https://romansara.ir/x"
+    )
+    assert text == "آوا شهر را ترک کرد."
+
+
+def test_a_keyword_list_is_not_a_summary():
+    assert details.is_keyword_stuffing("دانلود رمان تاوان | رمان عاشقانه | pdf رمان | رمان جدید")
+    assert details.is_keyword_stuffing("رمان جدید، رمان عاشقانه، رمان پلیسی، رمان ایرانی، دانلود")
+    assert not details.is_keyword_stuffing(
+        "آوا پس از سال‌ها زندگی مشترک به خیانت همسرش پی می‌برد و شهر را ترک می‌کند."
+    )
+
+
+def test_a_verbless_description_of_a_non_novel_product_survives():
+    """این اسکریپت فقط برای رمان نیست؛ توضیحِ جزوه لازم نیست فعل داشته باشد."""
+    assert not details.is_keyword_stuffing(
+        "نمونه سوالات فنی و حرفه‌ای کمک حسابدار همراه با پاسخنامه تشریحی و استاندارد سازمان"
+    )
 
 
 def test_audio_format_is_not_guessed_from_a_menu_link():
@@ -205,13 +322,56 @@ def test_summary_merges_new_sentences_and_drops_copied_ones():
     assert decision.value.count("خیانت همسرش") == 1  # جمله‌ی کپی‌شده دوبار نمی‌آید
 
 
-def test_a_translator_beats_the_iranian_label_of_the_sources():
-    decision = consensus.merge_nationality(["iranian", "iranian"], has_translator=True)
+def test_several_sources_that_agree_on_nothing_write_no_page_count():
+    """«۳۲۰ یا ۱۹۸؟» — سکه انداختن بدتر از خالی گذاشتن است."""
+    decision = consensus.merge_pages([[320], [198]])
+    assert not decision.filled
+    assert "توافق ندارند" in decision.note
+
+
+def test_a_translator_beats_the_tags_of_the_sources():
+    decision = consensus.merge_nationality(
+        ["term:iranian", "term:iranian"], has_translator=True
+    )
     assert decision.value == "foreign"
+
+
+def test_an_explicit_nationality_label_beats_a_sidebar_tag():
+    decision = consensus.merge_nationality(["label:iranian", "term:foreign", "term:foreign"])
+    assert decision.value == "iranian"
+
+
+def test_sources_that_split_evenly_on_nationality_write_nothing():
+    decision = consensus.merge_nationality(["term:iranian", "term:foreign"])
+    assert not decision.filled
+    assert "اختلاف" in decision.note
+
+
+def test_a_persian_author_with_no_other_sign_is_read_as_iranian():
+    decision = consensus.merge_nationality([], persian_author=True)
+    assert decision.value == "iranian"
+    assert "نام نویسنده" in decision.note
 
 
 def test_nationality_stays_empty_when_no_source_says_anything():
     assert not consensus.merge_nationality([]).filled
+
+
+def test_seo_junk_never_reaches_the_summary():
+    clean = SummaryBlock(
+        "آوا پس از سال‌ها زندگی مشترک به خیانت همسرش پی می‌برد و شهر را ترک می‌کند.", 3
+    )
+    junk = SummaryBlock(
+        "دانلود رمان تاوان خیانت | رمان عاشقانه | رمان جدید | pdf رمان | رمان ایرانی", 3
+    )
+    tail = SummaryBlock(
+        "او در شهر تازه با گذشته‌ی خانواده‌اش روبه‌رو می‌شود. #رمان_عاشقانه #دانلود_رمان", 3
+    )
+
+    decision = consensus.merge_summary([[clean], [junk], [tail]], min_chars=50)
+    assert "#" not in decision.value
+    assert "pdf رمان" not in decision.value
+    assert "گذشته‌ی خانواده‌اش" in decision.value  # جمله‌ی سالمِ همان منبع می‌ماند
 
 
 # ---------------------------------------------------------------------------

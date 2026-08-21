@@ -150,6 +150,15 @@ def merge_pages(
     value = int(median(best))
     if agreement < min_agreement and not accept_single:
         return Decision(note=f"فقط {agreement} منبع عدد داد")
+    if agreement < min_agreement and len(firsts) > 1:
+        # چند منبع عدد دادند و **هیچ دوتایی** با هم جور نیست. عددِ یکی از
+        # آن‌ها را برداشتن یعنی سکه انداختن؛ خواسته‌ی اصلی هم همین بود که
+        # «عددی نوشته شود که چند سایت رویش توافق دارند».
+        seen = "، ".join(str(number) for number in sorted(set(firsts)))
+        return Decision(
+            sources=len(firsts),
+            note=f"منابع توافق ندارند ({seen}) — دستی انتخاب شود",
+        )
     note = "" if agreement >= min_agreement else "تک‌منبعی — دستی چک شود"
     if len(clusters) > 1:
         spread = max(firsts) - min(firsts)
@@ -299,9 +308,14 @@ def merge_summary(
         for block in blocks
     ]
 
-    from .details import sentences as split_sentences
+    from .details import (
+        is_keyword_stuffing,
+        sentences as split_sentences,
+        strip_seo_noise,
+    )
 
     kept: list[str] = []
+    dropped = 0
     kept_keys: list[str] = []
     used_sources: set[int] = set()
     total = 0
@@ -312,8 +326,14 @@ def merge_summary(
         for sentence in split_sentences(text):
             if total >= max_chars or len(kept) >= max_sentences:
                 break
-            sentence = sentence.strip()
+            # هشتگ و لینک از خودِ جمله بیرون کشیده می‌شوند (جمله معمولاً سالم
+            # است و فقط آخرش هشتگ چسبانده‌اند)، ولی جمله‌ای که *خودش* فهرست
+            # کلمه‌ی کلیدی است کلاً کنار می‌رود.
+            sentence = strip_seo_noise(sentence)
             if len(sentence) < MIN_SENTENCE_CHARS:
+                continue
+            if is_keyword_stuffing(sentence):
+                dropped += 1
                 continue
             # مقایسه روی شکل نرمال‌شده‌ی *باکلمه* انجام می‌شود، نه کلید فشرده:
             # دو جمله با ترتیب متفاوت هم باید تکراری شمرده شوند.
@@ -332,6 +352,8 @@ def merge_summary(
         note = "کوتاه‌تر از حد انتظار — منابع خلاصه‌ی کاملی نداشتند"
     else:
         note = ""
+    if dropped:
+        note = (note + f" | {dropped} جمله‌ی تبلیغاتی/کلمه‌کلیدی حذف شد").strip(" |")
     return Decision(
         value=summary,
         votes=len(used_sources),
@@ -345,27 +367,63 @@ def merge_summary(
 # ---------------------------------------------------------------------------
 
 
-def merge_nationality(
-    hints: Iterable[str], has_translator: bool = False, foreign_author: bool = False
-) -> Decision:
-    """``foreign`` / ``iranian`` / خالی.
+#: قدرت شاهدهای ملیت، از قوی به ضعیف
+_NATIONALITY_RANKS = ("label", "sign", "term")
 
-    مترجم داشتن و لاتین بودن نام نویسنده، شاهدِ ساختاری‌اند و بر رأی‌گیری
-    برچسب سایت‌ها می‌چربند: سایتی که همه‌ی رمان‌ها را «ایرانی» زده باشد
-    نمی‌تواند رمانی که مترجم دارد را ایرانی کند.
+
+def merge_nationality(
+    hints: Iterable[str],
+    has_translator: bool = False,
+    foreign_author: bool = False,
+    persian_author: bool = False,
+) -> Decision:
+    """``foreign`` / ``iranian`` / خالی — با احترام به قدرتِ شاهد.
+
+    ورودی، شاهدهای ``قدرت:مقدار`` است (``label:iranian``، ``term:foreign``).
+    قوی‌ترین سطحی که شاهدی دارد، تنها سطحی است که رأی می‌دهد: برچسب صریحِ
+    «ملیت» با تگِ سایدبار سرشکن نمی‌شود.
+
+    اگر در آن سطح تساوی شد، چیزی نوشته نمی‌شود؛ ملیتِ غلط از ملیتِ خالی بدتر
+    است — سلول خالی را می‌شود فیلتر کرد، مقدار غلط را نه.
     """
-    counter = Counter(hint for hint in hints if hint)
+    levels: dict[str, Counter[str]] = {rank: Counter() for rank in _NATIONALITY_RANKS}
+    total = 0
+    for hint in hints:
+        if not hint:
+            continue
+        rank, _, value = str(hint).partition(":")
+        if not value:  # شکل قدیمی، بدون قدرت
+            rank, value = "term", rank
+        if rank in levels and value in ("foreign", "iranian"):
+            levels[rank][value] += 1
+            total += 1
+
     if has_translator or foreign_author:
-        return Decision(
-            value="foreign",
-            votes=max(1, counter.get("foreign", 0)),
-            sources=sum(counter.values()),
-            note="مترجم/نام لاتین" if not counter.get("foreign") else "",
-        )
-    if not counter:
-        return Decision(note="هیچ منبعی ملیت را مشخص نکرده بود")
-    value, votes = counter.most_common(1)[0]
-    return Decision(value=value, votes=votes, sources=sum(counter.values()))
+        # شاهد ساختاری هم‌رده‌ی برچسب صریح است، ولی برچسبِ صریحِ «ایرانی»
+        # نباید نادیده گرفته شود: آن‌وقت تصمیم می‌ماند برای رأی‌گیریِ پایین.
+        levels["sign"]["foreign"] += 1
+        total += 1
+
+    for rank in _NATIONALITY_RANKS:
+        counter = levels[rank]
+        if not counter:
+            continue
+        ranked = counter.most_common()
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return Decision(
+                sources=total,
+                note=f"منابع اختلاف دارند ({ranked[0][0]} {ranked[0][1]} / "
+                f"{ranked[1][0]} {ranked[1][1]}) — دستی انتخاب شود",
+            )
+        value, votes = ranked[0]
+        note = "" if votes > 1 or rank == "label" else "شاهد ضعیف — دستی چک شود"
+        return Decision(value=value, votes=votes, sources=total, note=note)
+
+    if persian_author:
+        # هیچ منبعی حرفی از ملیت نزده، هیچ مترجمی در کار نیست و نام نویسنده
+        # فارسی است. این ضعیف‌ترین شاهد است، پس در گزارش علامت می‌خورد.
+        return Decision(value="iranian", votes=1, sources=total, note="از روی نام نویسنده")
+    return Decision(note="هیچ منبعی ملیت را مشخص نکرده بود")
 
 
 def merge_formats(per_source: Sequence[Sequence[str]], default: str = "pdf") -> Decision:
@@ -449,6 +507,7 @@ def merge(
         foreign_author=any(
             is_latin_name(name) for page in pages_of_sources for name in page.authors
         ),
+        persian_author=merged.author.filled and not is_latin_name(merged.author.value),
     )
     merged.book_format = merge_formats([page.formats for page in pages_of_sources])
     merged.terms = merge_terms(

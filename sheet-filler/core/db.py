@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS pages (
     url        TEXT PRIMARY KEY,
     domain     TEXT,
     payload    TEXT,      -- JSON خروجی core.details
-    fetched_at TIMESTAMP
+    fetched_at TIMESTAMP,
+    version    INTEGER DEFAULT 0   -- نسخه‌ی قواعد استخراج (core.details)
 );
 
 -- نگاشت «عنوان → آدرس منبع». اگر از جای دیگری (مثلاً خروجی ابزار استخراج)
@@ -100,9 +101,25 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+#: ستون‌هایی که بعداً اضافه شده‌اند. ``CREATE TABLE IF NOT EXISTS`` روی
+#: دیتابیسِ موجود کاری نمی‌کند، پس ستون تازه باید صریح اضافه شود — وگرنه
+#: نصبِ به‌روزشده روی دیتابیسِ قدیمیِ کاربر می‌ترکد.
+_LATE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("pages", "version", "INTEGER DEFAULT 0"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, definition in _LATE_COLUMNS:
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 @contextmanager
@@ -311,9 +328,14 @@ def counts_of(conn: sqlite3.Connection, key: str) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def get_page(conn: sqlite3.Connection, url: str, ttl_days: int | None = None) -> dict | None:
+def get_page(
+    conn: sqlite3.Connection, url: str, ttl_days: int | None = None, version: int = 0
+) -> dict | None:
     row = conn.execute("SELECT * FROM pages WHERE url=?", (url,)).fetchone()
     if row is None:
+        return None
+    if version and int(row["version"] or 0) != version:
+        # قواعد استخراج عوض شده‌اند؛ نتیجه‌ی قدیمی دیگر معتبر نیست
         return None
     if ttl_days:
         try:
@@ -332,11 +354,14 @@ def get_page(conn: sqlite3.Connection, url: str, ttl_days: int | None = None) ->
     return data if isinstance(data, dict) else None
 
 
-def put_page(conn: sqlite3.Connection, url: str, domain: str, payload: dict) -> None:
+def put_page(
+    conn: sqlite3.Connection, url: str, domain: str, payload: dict, version: int = 0
+) -> None:
     with transaction(conn):
         conn.execute(
-            "INSERT OR REPLACE INTO pages (url, domain, payload, fetched_at) VALUES (?,?,?,?)",
-            (url, domain, json.dumps(payload, ensure_ascii=False), utcnow()),
+            "INSERT OR REPLACE INTO pages (url, domain, payload, fetched_at, version) "
+            "VALUES (?,?,?,?,?)",
+            (url, domain, json.dumps(payload, ensure_ascii=False), utcnow(), int(version)),
         )
 
 

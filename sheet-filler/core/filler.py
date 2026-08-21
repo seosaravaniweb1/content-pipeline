@@ -213,6 +213,7 @@ class FillStats:
     completed: int = 0
     partial: int = 0
     no_source: int = 0
+    failed: int = 0
     pages_fetched: int = 0
     from_cache: int = 0
     cells_written: int = 0
@@ -228,6 +229,7 @@ class FillStats:
             f"از قبل پر: {self.already_filled}، "
             f"پردازش‌شده: {self.processed}، کامل: {self.completed}، "
             f"ناقص: {self.partial}، بدون منبع: {self.no_source}"
+            + (f"، خطادار: {self.failed}" if self.failed else "")
         ]
         if self.filled:
             parts.append(
@@ -409,6 +411,7 @@ def _decide_choice(
             for piece in taxonomy.split_values(value):
                 if piece not in terms:
                     terms.append(piece)
+    terms = _drop_contradicting_terms(terms, common.nationality.value)
 
     matched = vocabulary.match(terms, title=title, text=common.summary.value)
     if not matched and not spec.options:
@@ -421,6 +424,18 @@ def _decide_choice(
         votes=len(matched),
         sources=len(pages),
     )
+
+
+def _drop_contradicting_terms(terms: Sequence[str], nationality: str) -> list[str]:
+    """تگِ «رمان ترجمه» روی رمانی که ایرانی تشخیص داده شده، تگِ سایدبار است.
+
+    فهرستِ دسته‌بندیِ سایت در همه‌ی صفحه‌ها تکرار می‌شود؛ بدون این فیلتر،
+    ستون دسته‌بندیِ یک رمان ایرانی «رمان خارجی» هم می‌گیرد.
+    """
+    if nationality not in ("iranian", "foreign"):
+        return list(terms)
+    opposite = "foreign" if nationality == "iranian" else "iranian"
+    return [term for term in terms if details.nationality_of_term(term) != opposite]
 
 
 def _numbers_of(values: Sequence[str], spec: fields.FieldSpec) -> list[int]:
@@ -616,12 +631,14 @@ def build_queue(job: _Job) -> list[tuple[gsheet.SheetRow, int, list[str]]]:
             title_key = normalizer.normalize(row.title, job.norm_config)
             row_id = db.upsert_row(conn, options.key, row.title, title_key, row.number)
             wanted = job.targets if options.overwrite == "always" else row.empty_fields(job.targets)
+            if options.overwrite == "mine":
+                wanted = _add_own_cells(job, row, title_key, wanted)
             if not wanted:
                 continue
             if _already_filled(job, row, wanted):
                 job.stats.already_filled += 1
                 continue
-            if _needs_work(conn, options.key, title_key, options):
+            if options.overwrite == "mine" or _needs_work(conn, options.key, title_key, options):
                 queue.append((row, row_id, wanted))
     job.stats.queued = len(queue)
     if job.stats.already_filled:
@@ -760,17 +777,46 @@ def run(
         say(f"{recovered} سلول از اجرای قبلی که به شیت نرسیده بود، نوشته شد.")
 
     queue = build_queue(job)
-    for index, (row, row_id, wanted) in enumerate(queue, start=1):
-        if stop():
-            job.stats.stopped_early = "به درخواست شما متوقف شد؛ بقیه‌ی ردیف‌ها در صف ماندند."
-            break
+    try:
+        for index, (row, row_id, wanted) in enumerate(queue, start=1):
+            if stop():
+                job.stats.stopped_early = "به درخواست شما متوقف شد؛ بقیه‌ی ردیف‌ها در صف ماندند."
+                break
+            _process_safely(job, row, row_id, wanted)
+            if len(job.ids) >= options.batch_rows:
+                job.stats.cells_written += _flush(conn, job.document, job.updates, job.ids)
+                job.updates, job.ids = [], []
+            if index % 10 == 0:
+                say(f"  {index}/{len(queue)} — نوشته‌شده: {job.stats.cells_written} سلول")
+    except KeyboardInterrupt:
+        job.stats.stopped_early = "با Ctrl+C متوقف شد؛ آنچه تا اینجا جمع شده نوشته می‌شود."
+    finally:
+        # هر اتفاقی هم بیفتد، سلول‌های جمع‌شده باید به شیت برسند: دوباره
+        # پیدا کردن همین دیتا یعنی صدها درخواست دیگر به سایت‌های منبع.
+        stats = finish(job)
+    return stats
+
+
+def _process_safely(job: _Job, row: gsheet.SheetRow, row_id: int, wanted: list[str]) -> None:
+    """یک ردیف — و اگر ترکید، همان‌جا دفن شود.
+
+    در ۱۵ هزار ردیف حتماً چند صفحه‌ی عجیب هست (HTMLِ نصفه، انکودینگ خراب،
+    قطعیِ وسط دانلود). قدیم همان یکی کل اجرا را می‌انداخت و بقیه‌ی ردیف‌ها
+    زمین می‌ماندند؛ حالا ردیف «خطادار» علامت می‌خورد و اجرا ادامه پیدا می‌کند.
+    """
+    try:
         process_row(job, row, row_id, wanted)
-        if len(job.ids) >= options.batch_rows:
-            job.stats.cells_written += _flush(conn, job.document, job.updates, job.ids)
-            job.updates, job.ids = [], []
-        if index % 10 == 0:
-            say(f"  {index}/{len(queue)} — نوشته‌شده: {job.stats.cells_written} سلول")
-    return finish(job)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 — یک ردیف نباید اجرا را بیندازد
+        job.stats.failed += 1
+        reason = f"{type(exc).__name__}: {exc}"[:200]
+        job.say(f"⚠ ردیف {row.number} («{row.title[:40]}») رد شد — {reason}")
+        try:
+            with db.transaction(job.conn):
+                db.save_values(job.conn, row_id, {}, status=db.PARTIAL, note=f"خطا — {reason}")
+        except Exception:  # noqa: BLE001 — حتی ثبت خطا هم نباید اجرا را بیندازد
+            pass
 
 
 def run_auto(
@@ -802,13 +848,24 @@ def run_auto(
     while not stop():
         round_number += 1
         fetcher = fetcher_factory()
+        stats = None
         try:
             stats = run(conn, config, options, fetcher, log=say, should_stop=stop)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # حالت خودکار یعنی برنامه شب هم کار می‌کند؛ یک قطعیِ اینترنت یا
+            # یک خطای موقتیِ گوگل نباید حلقه را برای همیشه بخواباند. دور بعد
+            # از همان‌جا ادامه می‌دهد، چون همه‌چیز در دیتابیس ثبت شده.
+            total.failed += 1
+            say(f"⚠ دور {round_number} با خطا تمام شد — {type(exc).__name__}: {exc}")
+            say("دور بعد از همان‌جا ادامه می‌دهد؛ چیزی از دست نرفته است.")
         finally:
             close = getattr(fetcher, "close", None)
             if close:
                 close()
-        _accumulate(total, stats)
+        if stats is not None:
+            _accumulate(total, stats)
 
         if (rounds and round_number >= rounds) or stop():
             break
@@ -831,6 +888,8 @@ def _accumulate(total: FillStats, stats: FillStats) -> None:
         "completed",
         "partial",
         "no_source",
+        "already_filled",
+        "failed",
         "pages_fetched",
         "from_cache",
         "cells_written",
@@ -882,6 +941,31 @@ def _known_urls(row: gsheet.SheetRow, column_key: str) -> list[str]:
     return re.findall(r"https?://\S+", row.values.get(column_key, ""))
 
 
+def _add_own_cells(
+    job: _Job, row: gsheet.SheetRow, title_key: str, wanted: list[str]
+) -> list[str]:
+    """سلول‌هایی که **خودِ برنامه** نوشته بود را هم به فهرست کار اضافه کن.
+
+    ملاک، مقایسه با چیزی است که دفعه‌ی قبل ذخیره شده: اگر محتوای فعلی سلول
+    دقیقاً همان است، مالِ ماست و می‌شود از نو ساختش؛ اگر فرق دارد یعنی شما
+    دستی عوضش کرده‌اید و دست نمی‌خورد.
+
+    برای وقتی است که قواعد استخراج دقیق‌تر شده و می‌خواهید ردیف‌های قبلی با
+    قواعد تازه دوباره ساخته شوند، بدون اینکه دست‌نوشته‌هایتان از بین برود.
+    """
+    previous = db.row_values(db.row_by_key(job.conn, job.options.key, title_key))
+    if not previous:
+        return wanted
+    out = list(wanted)
+    for key in job.targets:
+        if key in out:
+            continue
+        current = (row.values.get(key) or "").strip()
+        if current and current == (previous.get(key) or "").strip():
+            out.append(key)
+    return out
+
+
 def _already_filled(job: _Job, row: gsheet.SheetRow, wanted: Sequence[str]) -> bool:
     """ردیفی که کاربر خودش پرش کرده و فقط ستون‌های اختیاری‌اش خالی مانده.
 
@@ -892,7 +976,7 @@ def _already_filled(job: _Job, row: gsheet.SheetRow, wanted: Sequence[str]) -> b
     هیچ‌چیز در دیتابیس ثبت نمی‌شود؛ اگر بعداً همان ستون را لازم داشتید (مثلاً
     جمع‌آوری تصویر را روشن کردید)، ردیف دوباره به صف برمی‌گردد.
     """
-    if job.options.overwrite == "always":
+    if job.options.overwrite != "empty":
         return False
     if len(wanted) >= len(job.targets):
         # هیچ ستونی پر نشده: ردیف دست‌نخورده است، نه تمام‌شده

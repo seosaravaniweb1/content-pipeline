@@ -56,14 +56,17 @@ def page_details(
     خروجی استخراج کش می‌شود نه HTML خام: هم جای کمتری می‌گیرد و هم اجرای
     دوباره روی ۱۵ هزار عنوان یک درخواست تازه به سایت‌ها نمی‌زند.
     """
-    cached = db.get_page(conn, url, ttl_days)
+    cached = db.get_page(conn, url, ttl_days, version=details.EXTRACT_VERSION)
     if cached is not None:
         return PageDetails.from_dict(cached), True
     result = fetcher.fetch(url)
     if not result.ok:
         return None, False
-    extracted = details.extract_details(result.html, result.final_url or url, site_name)
-    db.put_page(conn, url, extracted.domain, extracted.as_dict())
+    try:
+        extracted = details.extract_details(result.html, result.final_url or url, site_name)
+    except Exception:  # noqa: BLE001 — یک صفحه‌ی خراب یعنی همان یک صفحه رد شود
+        return None, False
+    db.put_page(conn, url, extracted.domain, extracted.as_dict(), version=details.EXTRACT_VERSION)
     return extracted, False
 
 

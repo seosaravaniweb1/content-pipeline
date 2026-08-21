@@ -262,6 +262,63 @@ def test_overwrite_always_replaces_the_existing_value(env, tmp_path):
     assert document.values[1][1] == "رمان تاوان خیانت"
 
 
+def test_one_exploding_row_does_not_take_the_run_down(env, tmp_path, monkeypatch):
+    """در ۱۵ هزار ردیف حتماً یکی می‌ترکد؛ بقیه باید پر شوند."""
+    conn, config = env
+    good, bad = "دانلود رمان تاوان خیانت", "رمان مسئله‌دار"
+    link(conn, good, "https://a.ir/p/1")
+    link(conn, bad, "https://a.ir/p/boom")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[bad], [good]])
+
+    real = sources.collect
+
+    def explode(conn_, title, *args, **kwargs):
+        if title == bad:
+            raise RuntimeError("صفحه‌ی خراب")
+        return real(conn_, title, *args, **kwargs)
+
+    monkeypatch.setattr(sources, "collect", explode)
+    fetcher = FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE, "https://a.ir/p/boom": NOVEL_PAGE})
+
+    stats, document, options = fill(conn, config, path, fetcher, search={"enabled": False})
+    assert stats.failed == 1
+    assert document.values[2][2] == "آوا محمدی"      # ردیف سالم پر شده
+    rows = {row["title"]: row for row in db.rows_of(conn, options.key)}
+    assert "خطا" in (rows[bad]["note"] or "")
+
+
+def test_overwrite_mine_rebuilds_its_own_cells_but_not_yours(env, tmp_path):
+    """قواعد که دقیق‌تر شدند، ردیف‌های قبلی از نو ساخته می‌شوند — بی‌آنکه
+    چیزی که خودتان نوشته‌اید عوض شود."""
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+    fetcher = FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE})
+
+    _, document, options = fill(conn, config, path, fetcher, search={"enabled": False})
+    assert document.values[1][2] == "آوا محمدی"     # نوشته‌ی خودِ برنامه
+
+    # شیت بعد از اجرای اول، به‌علاوه‌ی یک دست‌نوشته‌ی کاربر در ستون خلاصه
+    filled = list(document.values[1])
+    filled[3] = "خلاصه‌ای که خودم نوشتم"
+    sheet_file(tmp_path, NOVEL_HEADER, [filled], name=path.name)  # همان شیت، پرشده
+
+    # منبع عوض شده: اجرا با «mine» باید سلولِ خودش را از نو بسازد
+    db.clear_pages(conn)
+    changed = NOVEL_PAGE.replace("آوا محمدی", "سارا احمدی")
+    _, document, _ = fill(
+        conn,
+        config,
+        path,
+        FakeFetcher({"https://a.ir/p/1": changed}),
+        search={"enabled": False},
+        overwrite="mine",
+    )
+    assert document.values[1][2] == "سارا احمدی"
+    assert document.values[1][3] == "خلاصه‌ای که خودم نوشتم"
+
+
 def test_a_title_with_no_source_is_reported_not_invented(env, tmp_path):
     conn, config = env
     path = sheet_file(tmp_path, NOVEL_HEADER, [["رمان بدون منبع"]])
