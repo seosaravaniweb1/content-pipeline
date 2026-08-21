@@ -178,6 +178,73 @@ def test_filled_cells_are_never_overwritten(env, tmp_path):
     assert document.values[1][9] == "398"  # ستون خالی پر شده است
 
 
+FILLED_NOVEL = [
+    "دانلود رمان تاوان خیانت", "رمان تاوان خیانت", "آوا محمدی", "خلاصه‌ی دستی من",
+    "رمان عاشقانه", "عاشقانه", "ایرانی", "PDF", "", "398", "",
+]
+
+
+def test_a_row_that_is_already_filled_is_not_worked_again(env, tmp_path):
+    """ردیفی که فقط ستون‌های اختیاری‌اش (تصویر، مترجم) خالی است، رد می‌شود."""
+    conn, config = env
+    link(conn, FILLED_NOVEL[0], "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [FILLED_NOVEL])
+    fetcher = FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE})
+
+    stats, document, _ = fill(conn, config, path, fetcher, search={"enabled": False})
+    assert stats.already_filled == 1
+    assert stats.queued == 0 and stats.processed == 0
+    assert fetcher.fetched == []                       # حتی یک صفحه هم دانلود نشد
+    assert document.values[1] == FILLED_NOVEL + ["", ""]
+
+
+def test_an_untouched_row_is_queued_even_when_every_column_is_optional(env, tmp_path):
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, ["عنوان", "Translator", "Image"], [[title]], name="thin.csv")
+
+    stats, _, _ = fill(
+        conn, config, path, FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE}), search={"enabled": False}
+    )
+    assert stats.already_filled == 0 and stats.processed == 1
+
+
+def test_with_images_off_the_image_column_is_left_alone(env, tmp_path):
+    """پیدا نشدن کاور نباید جلوی پر شدن بقیه‌ی ستون‌ها را بگیرد."""
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+    fetcher = FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE})
+
+    stats, document, options = fill(
+        conn, config, path, fetcher, search={"enabled": False}, image=False
+    )
+    assert stats.processed == 1
+    assert document.values[1][2] == "آوا محمدی"        # بقیه پر شده
+    assert document.values[1][10] == ""                 # ستون تصویر دست‌نخورده
+    assert "Image" not in (db.rows_of(conn, options.key)[0]["note"] or "")
+    assert "tavan-600x600" not in " ".join(fetcher.fetched)  # سراغ کاور هم نرفت
+
+
+def test_a_missing_cover_never_marks_a_row_incomplete(env, tmp_path):
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+    # تصویر صفحه دانلود می‌شود ولی مربع نیست: هیچ کاوری انتخاب نمی‌شود
+    fetcher = FakeFetcher(
+        {"https://a.ir/p/1": NOVEL_PAGE}, {"https://a.ir/up/tavan-600x600.jpg": png(600, 200)}
+    )
+
+    stats, document, options = fill(conn, config, path, fetcher, search={"enabled": False})
+    assert stats.processed == 1
+    assert document.values[1][10] == ""
+    # نبودِ کاور در دلیلِ «ناقص» بودن ردیف نمی‌آید
+    assert "Image" not in (db.rows_of(conn, options.key)[0]["note"] or "")
+
+
 def test_overwrite_always_replaces_the_existing_value(env, tmp_path):
     conn, config = env
     title = "دانلود رمان تاوان خیانت"

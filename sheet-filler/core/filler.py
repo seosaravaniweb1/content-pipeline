@@ -208,6 +208,7 @@ def _sites_from(merged: dict, config: Config) -> list[SourceSite]:
 class FillStats:
     rows: int = 0
     queued: int = 0
+    already_filled: int = 0
     processed: int = 0
     completed: int = 0
     partial: int = 0
@@ -224,6 +225,7 @@ class FillStats:
     def render(self) -> str:
         parts = [
             f"ردیف‌های شیت: {self.rows}، در صف: {self.queued}، "
+            f"از قبل پر: {self.already_filled}، "
             f"پردازش‌شده: {self.processed}، کامل: {self.completed}، "
             f"ناقص: {self.partial}، بدون منبع: {self.no_source}"
         ]
@@ -565,12 +567,19 @@ def prepare(
     """خواندن شیت، ساخت نقشه‌ی ستون‌ها و گزارش آنچه دیده شد."""
     document = document or gsheet.open_document(options.sheet)
     plan, rows, lists = inspect(options, document)
+    specs = options.writable(plan)
+    dropped = []
+    if not options.image.enabled:
+        # «جمع‌آوری تصویر» خاموش است: ستون تصویر اصلاً هدف این اجرا نیست —
+        # نه دنبالش می‌گردیم، نه ردیفی را فقط به‌خاطرش در صف می‌گذاریم.
+        dropped = [spec.column for spec in specs if spec.kind == fields.KIND_IMAGE]
+        specs = [spec for spec in specs if spec.kind != fields.KIND_IMAGE]
     job = _Job(
         conn=conn,
         options=options,
         document=document,
         plan=plan,
-        specs=options.writable(plan),
+        specs=specs,
         rows=rows,
         norm_config=normalizer.config_from_mapping(config.get("normalizer", {})),
         fetcher=fetcher,
@@ -584,6 +593,8 @@ def prepare(
     )
     if lists:
         say("لیست‌ها — " + "، ".join(f"{name}: {len(values)}" for name, values in lists.items()))
+    if dropped:
+        say("جمع‌آوری تصویر خاموش است — " + "، ".join(dropped) + " دست‌نخورده می‌ماند.")
     if not job.specs:
         say("⚠ هیچ ستون قابل نوشتنی پیدا نشد؛ فقط دیتابیس پر می‌شود.")
 
@@ -605,9 +616,16 @@ def build_queue(job: _Job) -> list[tuple[gsheet.SheetRow, int, list[str]]]:
             title_key = normalizer.normalize(row.title, job.norm_config)
             row_id = db.upsert_row(conn, options.key, row.title, title_key, row.number)
             wanted = job.targets if options.overwrite == "always" else row.empty_fields(job.targets)
-            if wanted and _needs_work(conn, options.key, title_key, options):
+            if not wanted:
+                continue
+            if _already_filled(job, row, wanted):
+                job.stats.already_filled += 1
+                continue
+            if _needs_work(conn, options.key, title_key, options):
                 queue.append((row, row_id, wanted))
     job.stats.queued = len(queue)
+    if job.stats.already_filled:
+        job.say(f"{job.stats.already_filled} ردیف از قبل پر بود و رد شد.")
     if options.limit and options.limit < len(queue):
         job.say(f"سقف این اجرا: {options.limit} ردیف از {len(queue)} ردیفِ در صف")
         queue = queue[: options.limit]
@@ -645,15 +663,19 @@ def process_row(job: _Job, row: gsheet.SheetRow, row_id: int, wanted: list[str])
         )
         return
 
-    pick = _pick_image(pages, options, job.fetcher)
+    # وقتی ستون تصویری در کار نیست، دنبال کاور نمی‌گردیم: هر کاندید یعنی چند
+    # درخواست اضافه برای چیزی که قرار نیست نوشته شود.
+    wants_image = any(spec.kind == fields.KIND_IMAGE for spec in job.specs)
+    pick = _pick_image(pages, options, job.fetcher) if wants_image else images.ImagePick()
     values, evidence, _ = build_values(
         row.title, pages, options, job.specs, job.norm_config, image_pick=pick
     )
 
-    required = [
-        spec.key for spec in job.specs if spec.required and _expected(spec, values, options)
+    missing = [
+        spec.key
+        for spec in job.specs
+        if spec.required and spec.key in wanted and not values.get(spec.key)
     ]
-    missing = [name for name in required if name in wanted and not values.get(name)]
     status = db.DONE if not missing else db.PARTIAL
     note = "" if not missing else "پر نشد: " + "، ".join(job.titles.get(n, n) for n in missing)
     with db.transaction(conn):
@@ -860,15 +882,23 @@ def _known_urls(row: gsheet.SheetRow, column_key: str) -> list[str]:
     return re.findall(r"https?://\S+", row.values.get(column_key, ""))
 
 
-def _expected(spec: fields.FieldSpec, values: dict[str, str], options: FillOptions) -> bool:
-    """آیا خالی ماندن این ستون واقعاً نقص است؟
+def _already_filled(job: _Job, row: gsheet.SheetRow, wanted: Sequence[str]) -> bool:
+    """ردیفی که کاربر خودش پرش کرده و فقط ستون‌های اختیاری‌اش خالی مانده.
 
-    مترجم فقط برای اثر خارجی انتظار می‌رود؛ خالی بودنش برای اثر ایرانی نقص
-    نیست و نباید ردیف را «ناقص» علامت بزند.
+    چنین ردیفی نباید دوباره کار شود: «Image» یا «مترجمِ» یک اثر ایرانی همیشه
+    خالی می‌ماند و اگر ملاک فقط خالی بودن سلول باشد، هر اجرا بودجه‌اش را صرف
+    ردیف‌های تمام‌شده می‌کند — دقیقاً همان چیزی که نباید بشود.
+
+    هیچ‌چیز در دیتابیس ثبت نمی‌شود؛ اگر بعداً همان ستون را لازم داشتید (مثلاً
+    جمع‌آوری تصویر را روشن کردید)، ردیف دوباره به صف برمی‌گردد.
     """
-    if spec.key != "translator":
-        return True
-    return values.get("nationality") == options.labels.get("foreign", "خارجی")
+    if job.options.overwrite == "always":
+        return False
+    if len(wanted) >= len(job.targets):
+        # هیچ ستونی پر نشده: ردیف دست‌نخورده است، نه تمام‌شده
+        return False
+    optional = {spec.key for spec in job.specs if not spec.required}
+    return all(key in optional for key in wanted)
 
 
 def _needs_work(

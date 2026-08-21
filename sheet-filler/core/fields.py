@@ -261,6 +261,9 @@ BUILTIN: tuple[FieldSpec, ...] = (
         kind=KIND_IMAGE,
         column="Image",
         labels=("تصویر", "عکس", "کاور", "لینک تصویر", "image"),
+        # کاورِ مربعِ بی‌واترمارک همیشه پیدا نمی‌شود و نبودنش نباید ردیفی را
+        # که بقیه‌اش کامل است «ناقص» کند؛ تصویر کار دستی خودتان است.
+        required=False,
     ),
     FieldSpec(
         key="status",
