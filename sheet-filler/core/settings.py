@@ -118,7 +118,56 @@ FIELDS: tuple[Setting, ...] = (
         default=True,
         hint="خاموشش کنید تا ستون تصویر دست‌نخورده بماند و اجرا وقتش را صرف کاور نکند.",
     ),
+    # --- بازبینِ هوشمند ----------------------------------------------------
+    Setting(
+        "ai_enabled",
+        BOOL,
+        "بازبینِ هوش مصنوعی",
+        default=False,
+        hint="مدل، نتیجه‌ی قواعد را بازبینی می‌کند: خلاصه، دسته‌بندی، و تشخیص کتابِ هم‌نام.",
+    ),
+    Setting(
+        "ai_provider",
+        CHOICE,
+        "سرویس مدل",
+        default="local",
+        choices=(
+            ("local", "مدل محلی روی همین کامپیوتر (Ollama) — رایگان"),
+            ("openrouter", "OpenRouter — یک کلید، ده‌ها مدل (مدل‌های :free رایگان‌اند)"),
+            ("claude", "Claude — دقیق‌ترین، با هزینه"),
+        ),
+    ),
+    Setting(
+        "ai_model",
+        TEXT,
+        "نام مدل",
+        hint="برای OpenRouter با «python -m sheet_filler.run models» فهرست زنده را ببینید.",
+    ),
+    Setting(
+        "ai_api_key",
+        TEXT,
+        "کلید سرویس",
+        hint="برای مدل محلی لازم نیست. خالی = از متغیر محیطی خوانده می‌شود.",
+    ),
+    Setting(
+        "ai_scope",
+        CHOICE,
+        "مدل کجا دخالت کند",
+        default="uncertain",
+        choices=(
+            ("uncertain", "فقط جایی که قواعد گیر کرده‌اند — ارزان و سریع"),
+            ("all", "همه‌ی ستون‌های هر ردیف — گران‌تر و کندتر"),
+        ),
+    ),
     # --- پیشرفته ---------------------------------------------------------
+    Setting(
+        "ai_base_url",
+        TEXT,
+        "آدرس سرویس محلی",
+        default="http://127.0.0.1:11434",
+        advanced=True,
+        hint="فقط برای Ollama.",
+    ),
     Setting(
         "sources_column",
         TEXT,

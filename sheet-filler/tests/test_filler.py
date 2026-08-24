@@ -16,7 +16,7 @@ import zlib
 
 import pytest
 
-from sheet_filler.core import db, filler, fields, gsheet, normalizer, sources
+from sheet_filler.core import ai, db, filler, fields, gsheet, normalizer, sources
 from sheet_filler.core.config import load_config
 from sheet_filler.web import server as web_server
 
@@ -747,5 +747,163 @@ def test_settings_have_one_definition(env):
         and field.key not in {"sheet_url", "service_account_json", "tab", "file",
                               "title_column", "sources_column", "lists_tab",
                               "report_tab", "header_row", "image"}
+        # تنظیم‌های ai_* داخل بلوک ``options.ai`` می‌نشینند، نه مستقیم روی options
+        and not (field.key.startswith("ai_")
+                 and field.key[3:] in ai.AIConfig.__dataclass_fields__)
     }
     assert not unknown, f"تنظیم‌های بی‌صاحب: {unknown}"
+
+
+# ---------------------------------------------------------------------------
+# بازبینِ هوش مصنوعی
+# ---------------------------------------------------------------------------
+
+AI_PAGE = NOVEL_PAGE.replace(
+    "<p>آوا پس از سال‌ها زندگی مشترک به خیانت همسرش پی می‌برد و تصمیم می‌گیرد شهر را\nترک کند تا زندگی تازه‌ای بسازد.</p>",
+    "<p>آوا پس از سال‌ها زندگی مشترک به خیانت همسرش پی می‌برد و تصمیم می‌گیرد شهر را ترک کند.</p>",
+)
+
+
+def ai_config(**over):
+    return ai.AIConfig(**{"enabled": True, "provider": "local", "model": "test", **over})
+
+
+def fake_ask(reply: str):
+    def ask(config, prompt):
+        ask.prompts.append(prompt)
+        return reply
+    ask.prompts = []
+    return ask
+
+
+def test_the_model_may_only_pick_from_the_allowed_options():
+    """مدل حق ندارد گزینه‌ی تازه بسازد؛ کرکره‌ی گوگل‌شیت قبولش نمی‌کند."""
+    asks = [ai.FieldAsk(key="categories", column="Categories", kind="multi_choice",
+                        options=("رمان عاشقانه", "رمان اجتماعی"), max_values=2)]
+    reply = json.dumps({"fields": {"categories": {
+        "value": ["رمان عاشقانه", "ژانر تازه‌ی اختراعی"], "confidence": 0.9}}})
+    page = filler.details.extract_details(NOVEL_PAGE, "https://a.ir/p/1")
+    result = ai.review("عنوان", [page], asks, ai_config(), ask=fake_ask(reply))
+    assert result.values["categories"] == "رمان عاشقانه"
+
+
+def test_a_low_confidence_answer_is_ignored():
+    asks = [ai.FieldAsk(key="author", column="Author", kind="person")]
+    reply = json.dumps({"fields": {"author": {"value": "کسی", "confidence": 0.2}}})
+    page = filler.details.extract_details(NOVEL_PAGE, "https://a.ir/p/1")
+    result = ai.review("عنوان", [page], asks, ai_config(), ask=fake_ask(reply))
+    assert not result.values
+
+
+def test_the_model_can_reject_a_source_about_another_book(env, tmp_path):
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+    page = filler.details.extract_details(NOVEL_PAGE, "https://a.ir/p/1")
+    reply = json.dumps({"sources": [{"id": 1, "same_product": False, "why": "نویسنده فرق دارد"}]})
+    result = ai.review(title, [page], [ai.FieldAsk("author", "Author", "person")],
+                       ai_config(), ask=fake_ask(reply))
+    assert result.rejected_sources == ["https://a.ir/p/1"]
+
+
+def test_a_model_that_answers_with_junk_never_breaks_the_run(env, tmp_path):
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+
+    stats, document, _ = fill(
+        conn, config, path, FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE}),
+        search={"enabled": False},
+        ai_enabled=True, ai_provider="local", ai_model="test",
+        ai_base_url="http://127.0.0.1:1",   # هیچ سرویسی آنجا نیست
+    )
+    assert stats.ai_failed >= 1
+    assert document.values[1][2] == "آوا محمدی"   # جوابِ قواعد سر جایش ماند
+
+
+def test_the_prompt_carries_the_sources_not_the_raw_html():
+    page = filler.details.extract_details(NOVEL_PAGE, "https://a.ir/p/1")
+    prompt = ai.build_prompt(
+        "دانلود رمان تاوان خیانت",
+        [ai.FieldAsk("summary", "Summary", "summary")],
+        [page],
+        ai_config(),
+    )
+    assert "خیانت همسرش" in prompt          # متنِ استخراج‌شده هست
+    assert "<html" not in prompt and "<td>" not in prompt   # HTML خام نیست
+
+
+# ---------------------------------------------------------------------------
+# کتابِ هم‌نام
+# ---------------------------------------------------------------------------
+
+
+def test_a_same_titled_book_by_another_author_is_dropped(env, tmp_path):
+    """سه منبع «آوا محمدی» می‌گویند و یکی «سارا احمدی» — آن یکی کتاب دیگری است."""
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    other = NOVEL_PAGE.replace("آوا محمدی", "سارا احمدی").replace("۳۹۸", "۱۲۰")
+    pages = {f"https://s{i}.ir/p": NOVEL_PAGE for i in range(1, 4)}
+    pages["https://s4.ir/p"] = other
+    for url in pages:
+        link(conn, title, url)
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title]])
+
+    stats, document, _ = fill(
+        conn, config, path, FakeFetcher(pages), search={"enabled": False}
+    )
+    assert stats.mismatched_sources == 1
+    assert document.values[1][2] == "آوا محمدی"
+    assert document.values[1][9] == "398"    # عددِ کتابِ دیگر رأی نداد
+
+
+def test_the_author_in_your_sheet_picks_between_same_titled_books(env, tmp_path):
+    """شیت می‌گوید «سارا احمدی»؛ از دو منبعِ هم‌نام، همان یکی می‌ماند."""
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    mine = NOVEL_PAGE.replace("آوا محمدی", "سارا احمدی").replace("۳۹۸", "۲۱۰")
+    link(conn, title, "https://a.ir/p/1")
+    link(conn, title, "https://b.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title, "", "سارا احمدی"]])
+
+    stats, document, _ = fill(
+        conn, config, path,
+        FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE, "https://b.ir/p/1": mine}),
+        search={"enabled": False},
+    )
+    assert stats.mismatched_sources == 1
+    assert document.values[1][9] == "210"      # تعداد صفحه از کتابِ درست
+
+
+def test_a_sheet_author_no_source_agrees_with_does_not_empty_the_row(env, tmp_path):
+    """املای نامِ شیت ممکن است با منابع فرق کند؛ ردیف نباید خالی بماند."""
+    conn, config = env
+    title = "دانلود رمان تاوان خیانت"
+    link(conn, title, "https://a.ir/p/1")
+    path = sheet_file(tmp_path, NOVEL_HEADER, [[title, "", "کسی که هیچ منبعی نگفته"]])
+
+    stats, document, _ = fill(
+        conn, config, path, FakeFetcher({"https://a.ir/p/1": NOVEL_PAGE}),
+        search={"enabled": False},
+    )
+    assert stats.no_source == 0
+    assert document.values[1][9] == "398"       # بقیه‌ی ستون‌ها پر شدند
+    assert document.values[1][2] == "کسی که هیچ منبعی نگفته"   # دست‌نوشته دست‌نخورده
+
+
+# ---------------------------------------------------------------------------
+# پیشرفت
+# ---------------------------------------------------------------------------
+
+
+def test_progress_reports_a_percentage_and_an_estimate():
+    line = filler.progress_line(done=5, total=20, started=0.0, cells=31)
+    assert "25٪" in line and "5/20" in line
+
+
+def test_coverage_says_what_share_of_rows_got_each_column():
+    stats = filler.FillStats(queued=10, processed=10, filled={"Author": 8, "Summary": 5})
+    assert stats.percent == 100
+    assert stats.coverage() == {"Author": 80, "Summary": 50}

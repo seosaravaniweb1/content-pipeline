@@ -212,6 +212,34 @@ $("#clearCacheBtn").addEventListener("click", async () => {
   } catch (error) { toast(error.message, true); }
 });
 
+/* ----------------------------------------------------------- پیشرفت */
+function humanTime(seconds) {
+  seconds = Math.round(seconds || 0);
+  if (seconds < 90) return `${seconds} ثانیه`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} دقیقه`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  return minutes ? `${hours} ساعت و ${minutes} دقیقه` : `${hours} ساعت`;
+}
+
+function applyProgress(job) {
+  const bar = $("#bar"), note = $("#progressNote");
+  if (!bar || !note) return;
+  const running = job.status === "running";
+  const percent = job.status === "done" ? 100 : (job.percent || 0);
+  bar.style.width = `${percent}%`;
+  bar.classList.toggle("done", job.status === "done");
+  if (!job.total && !running) {
+    note.textContent = job.status === "idle"
+      ? "هنوز اجرایی شروع نشده." : "ردیفی در صف نبود.";
+    return;
+  }
+  const bits = [`${percent}٪`, `${job.done || 0} از ${job.total || 0} ردیف`];
+  if (running && job.eta) bits.push(`~${humanTime(job.eta)} مانده`);
+  if (job.elapsed) bits.push(`${humanTime(job.elapsed)} گذشته`);
+  note.textContent = bits.join(" — ");
+}
+
 /* --------------------------------------------------------------- اجرا */
 function applyJob(job) {
   if (!job) return;
@@ -225,6 +253,7 @@ function applyJob(job) {
     (labels[job.status] || job.status) + elapsed + (job.error ? ` — ${job.error}` : "");
   for (const id of ["#runBtn", "#runBtn2", "#tryBtn"]) $(id).disabled = job.status === "running";
   for (const id of ["#cancelBtn", "#cancelBtn2"]) $(id).disabled = job.status !== "running";
+  applyProgress(job);
 
   if (job.next !== undefined && job.next < state.logNext) {
     $("#log").textContent = "";

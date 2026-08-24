@@ -253,3 +253,18 @@ a.button-like {
   display: inline-block; text-decoration: none; padding: .4rem .7rem;
   border: 1px solid var(--line); border-radius: 8px; color: var(--ink);
 }
+
+
+/* -------------------------------------------------------------- پیشرفت */
+/* اجرای ۱۵ هزار ردیفی ساعت‌ها طول می‌کشد؛ بدون نوار پیشرفت، پنجره‌ای است
+   که معلوم نیست کار می‌کند یا گیر کرده. */
+.progress {
+  height: .75rem; border-radius: 999px; overflow: hidden;
+  background: var(--line); margin: .25rem 0 .6rem;
+}
+.progress .bar {
+  height: 100%; width: 0; border-radius: 999px;
+  background: var(--accent, #2563eb);
+  transition: width .4s ease;
+}
+.progress .bar.done { background: var(--ok, #16a34a); }

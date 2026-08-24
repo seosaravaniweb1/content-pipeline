@@ -90,6 +90,22 @@ class JobState:
     summary: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
+    #: پیشرفتِ اجرای جاری — ردیف‌های تمام‌شده از کلِ صف
+    done: int = 0
+    total: int = 0
+
+    @property
+    def percent(self) -> int:
+        if not self.total:
+            return 0
+        return min(100, int(round(100 * self.done / self.total)))
+
+    def eta(self) -> float:
+        """ثانیه‌ی باقی‌مانده — از سرعتِ واقعیِ همین اجرا."""
+        if not (self.done and self.total and self.started_at):
+            return 0.0
+        spent = (self.finished_at or time.time()) - self.started_at
+        return max(0.0, spent / self.done * (self.total - self.done))
 
     def as_dict(self) -> dict:
         return {
@@ -98,6 +114,10 @@ class JobState:
             "auto": self.auto,
             "error": self.error,
             "summary": self.summary,
+            "done": self.done,
+            "total": self.total,
+            "percent": self.percent,
+            "eta": round(self.eta()),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "elapsed": round((self.finished_at or time.time()) - self.started_at, 1)
@@ -200,6 +220,10 @@ class JobRunner:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    def _progress(self, done: int, total: int) -> None:
+        with self._lock:
+            self._state.done, self._state.total = done, total
+
     def _finish(self, status: str, error: str = "", summary: str = "") -> None:
         with self._lock:
             self._state.status = status
@@ -225,6 +249,7 @@ class JobRunner:
                     lambda: http.fetcher_from_config(self.config),
                     log=self.log,
                     should_stop=self._cancel.is_set,
+                    on_progress=self._progress,
                 )
             else:
                 with http.fetcher_from_config(self.config) as fetcher:
@@ -240,6 +265,7 @@ class JobRunner:
                         fetcher,
                         log=self.log,
                         should_stop=self._cancel.is_set,
+                        on_progress=self._progress,
                     )
             summary = stats.render()
             for line in summary.splitlines():

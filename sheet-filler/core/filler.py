@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+from . import ai as ai_mod
 from . import (
     consensus,
     db,
@@ -96,6 +98,8 @@ class FillOptions:
     sheet: gsheet.SheetSettings = field(default_factory=gsheet.SheetSettings)
     image: images.ImageRules = field(default_factory=images.ImageRules)
     sites: list[SourceSite] = field(default_factory=list)
+    #: بازبینِ هوش مصنوعی — پیش‌فرض خاموش
+    ai: ai_mod.AIConfig = field(default_factory=ai_mod.AIConfig)
 
     # -- چیزهایی که کاربر تصمیم می‌گیرد ------------------------------------
     overwrite: str = "empty"
@@ -140,7 +144,7 @@ class FillOptions:
 _SIMPLE_KEYS = {
     name
     for name in FillOptions.__dataclass_fields__
-    if name not in {"sheet", "image", "sites", "labels", "summary", "numbers", "taxonomy"}
+    if name not in {"sheet", "image", "sites", "ai", "labels", "summary", "numbers", "taxonomy"}
 }
 def options_from_config(config: Config, overrides: dict | None = None) -> FillOptions:
     """``config.yaml`` + تنظیمات پنل → :class:`FillOptions`.
@@ -180,6 +184,7 @@ def options_from_config(config: Config, overrides: dict | None = None) -> FillOp
             {**(config.get("image", {}) or {}), "enabled": merged.get("image", True)}
         ),
         sites=_sites_from(merged, config),
+        ai=ai_mod.AIConfig.from_mapping(_ai_settings(merged, config)),
     )
     for key, value in merged.items():
         if key in _SIMPLE_KEYS and value is not None:
@@ -191,6 +196,22 @@ def options_from_config(config: Config, overrides: dict | None = None) -> FillOp
     options.numbers = dict(config.get("fill.numbers", {}) or {})
     options.taxonomy = dict(config.get("fill.taxonomy", {}) or {})
     return options
+
+
+#: تنظیم‌های پنل که به بلوک ``ai`` می‌روند (``ai_model`` → ``model``)
+_AI_KEYS = ("enabled", "provider", "model", "api_key", "scope", "base_url")
+
+
+def _ai_settings(merged: dict, config: Config) -> dict:
+    """بلوک ``ai`` از config، به‌علاوه‌ی چیزی که کاربر در پنل عوض کرده."""
+    block = dict(config.get("ai", {}) or {})
+    for name in _AI_KEYS:
+        value = merged.get(f"ai_{name}")
+        if value not in (None, ""):
+            block[name] = value
+    if merged.get("ai_enabled") is not None:
+        block["enabled"] = bool(merged["ai_enabled"])
+    return block
 
 
 def _sites_from(merged: dict, config: Config) -> list[SourceSite]:
@@ -214,6 +235,11 @@ class FillStats:
     partial: int = 0
     no_source: int = 0
     failed: int = 0
+    #: منابعی که درباره‌ی کتابِ هم‌نامِ دیگری بودند و کنار گذاشته شدند
+    mismatched_sources: int = 0
+    ai_reviewed: int = 0
+    ai_changed: int = 0
+    ai_failed: int = 0
     pages_fetched: int = 0
     from_cache: int = 0
     cells_written: int = 0
@@ -223,6 +249,22 @@ class FillStats:
     stopped_early: str = ""
     filled: dict[str, int] = field(default_factory=dict)
 
+    @property
+    def percent(self) -> int:
+        """درصدِ پیشرفتِ همین اجرا — ردیف‌های در صف، نه کل شیت."""
+        if not self.queued:
+            return 100
+        return min(100, int(round(100 * self.processed / self.queued)))
+
+    def coverage(self) -> dict[str, int]:
+        """هر ستون برای چند درصدِ ردیف‌های پردازش‌شده پر شد."""
+        if not self.processed:
+            return {}
+        return {
+            name: int(round(100 * count / self.processed))
+            for name, count in sorted(self.filled.items(), key=lambda kv: -kv[1])
+        }
+
     def render(self) -> str:
         parts = [
             f"ردیف‌های شیت: {self.rows}، در صف: {self.queued}، "
@@ -231,10 +273,22 @@ class FillStats:
             f"ناقص: {self.partial}، بدون منبع: {self.no_source}"
             + (f"، خطادار: {self.failed}" if self.failed else "")
         ]
+        if self.mismatched_sources:
+            parts.append(f"  منابعِ کتابِ هم‌نام که کنار رفتند: {self.mismatched_sources}")
+        if self.ai_reviewed or self.ai_failed:
+            parts.append(
+                f"  بازبینِ هوشمند: {self.ai_reviewed} ردیف دیده شد، "
+                f"{self.ai_changed} سلول اصلاح شد"
+                + (f"، {self.ai_failed} بار خطا داد" if self.ai_failed else "")
+            )
         if self.filled:
             parts.append(
                 "  ستون‌های پرشده — "
-                + "، ".join(f"{key}: {value}" for key, value in self.filled.items() if value)
+                + "، ".join(
+                    f"{key}: {value} ({self.coverage().get(key, 0)}٪)"
+                    for key, value in self.filled.items()
+                    if value
+                )
             )
         parts.append(
             f"  صفحات منبع: {self.pages_fetched} دانلود / {self.from_cache} از کش، "
@@ -424,6 +478,195 @@ def _decide_choice(
         votes=len(matched),
         sources=len(pages),
     )
+
+
+# ---------------------------------------------------------------------------
+# بازبینِ هوش مصنوعی
+# ---------------------------------------------------------------------------
+
+#: ستون‌هایی که مدل واقعاً کمک می‌کند: معنا لازم دارند، نه الگو
+_AI_KINDS = (
+    fields.KIND_SUMMARY,
+    fields.KIND_CHOICE,
+    fields.KIND_MULTI,
+    fields.KIND_PERSON,
+    fields.KIND_NUMBER,
+    fields.KIND_TEXT,
+    fields.KIND_BOOL,
+)
+
+
+def shaky(
+    spec: fields.FieldSpec, values: dict[str, str], evidence: dict[str, dict],
+    options: FillOptions
+) -> str:
+    """آیا قواعد روی این ستون گیر کرده‌اند؟ اگر بله، دلیلش.
+
+    این تابع تعیین می‌کند AI کجا خرج شود. بدونش یا باید همه‌ی ردیف‌ها را به
+    مدل داد (گران و کند) یا هیچ‌کدام را (بی‌فایده).
+    """
+    item = evidence.get(spec.key) or {}
+    value = values.get(spec.key, "")
+    note = str(item.get("note") or "")
+    if not value:
+        return "خالی ماند"
+    if "توافق ندارند" in note or "اختلاف" in note:
+        return "منابع ناموافق"
+    if "تک‌منبعی" in note or "شاهد ضعیف" in note or "نام نویسنده" in note:
+        return "شاهد ضعیف"
+    if spec.kind == fields.KIND_SUMMARY:
+        least = int(options.summary.get("min_chars", 200))
+        if len(value) < least:
+            return "خلاصه‌ی کوتاه"
+        if int(item.get("votes", 0)) < 2 and int(item.get("sources", 0)) > 1:
+            return "خلاصه از یک منبع"
+    if spec.kind == fields.KIND_MULTI:
+        # «۹۹٪ رمان‌ها عاشقانه‌اند ولی گاهی دسته‌ها کم است» — ستون چندمقداری که
+        # فقط یک مقدار گرفته، همان جایی است که قاعده کم آورده.
+        if len([part for part in value.split("،") if part.strip()]) < 2:
+            return "دسته‌ی ناکافی"
+    return ""
+
+
+def _ai_review(
+    job: _Job,
+    row: gsheet.SheetRow,
+    pages: list[PageDetails],
+    wanted: Sequence[str],
+    values: dict[str, str],
+    evidence: dict[str, dict],
+    common: consensus.MergedDetails,
+    pick: images.ImagePick,
+) -> list[PageDetails]:
+    """مقدارهای ساخته‌شده را به مدل نشان بده و اصلاحش را بپذیر.
+
+    ``values`` و ``evidence`` **در جا** عوض می‌شوند. خروجی، فهرست منابع است
+    که ممکن است کوتاه‌تر شده باشد (مدل صفحه‌ای را نامربوط تشخیص داده).
+    """
+    config = job.options.ai
+    if not config.enabled or not pages:
+        return pages
+
+    targets = [spec for spec in job.specs if spec.key in wanted and spec.kind in _AI_KINDS]
+    if config.scope == ai_mod.SCOPE_UNSURE:
+        targets = [
+            spec for spec in targets if shaky(spec, values, evidence, job.options)
+        ]
+    if not targets:
+        return pages
+
+    asks = [
+        ai_mod.FieldAsk(
+            key=spec.key,
+            column=spec.column,
+            kind=spec.kind,
+            options=tuple(_ai_options(spec, job.options)),
+            max_values=spec.max_values,
+            guess=values.get(spec.key, ""),
+        )
+        for spec in targets
+    ]
+    try:
+        result = ai_mod.review(row.title, pages, asks, config)
+    except ai_mod.AIError as exc:
+        job.stats.ai_failed += 1
+        job.say(f"  ⚠ بازبینِ هوشمند برای ردیف {row.number} انجام نشد — {exc}")
+        return pages
+    job.stats.ai_reviewed += 1
+
+    if result.rejected_sources:
+        kept = [page for page in pages if page.url not in set(result.rejected_sources)]
+        if kept:
+            job.stats.mismatched_sources += len(pages) - len(kept)
+            pages = kept
+
+    for spec in targets:
+        fresh = result.values.get(spec.key, "")
+        if not fresh or fresh == values.get(spec.key):
+            continue
+        item = evidence.setdefault(spec.key, {"column": spec.column, "kind": spec.kind})
+        item["was"] = values.get(spec.key, "")
+        item["by"] = "AI"
+        item["confidence"] = result.confidence.get(spec.key, 0)
+        item["note"] = (str(item.get("note") or "") + " | اصلاحِ هوش مصنوعی").strip(" |")
+        values[spec.key] = fresh
+        job.stats.ai_changed += 1
+    return pages
+
+
+def _ai_options(spec: fields.FieldSpec, options: FillOptions) -> list[str]:
+    """گزینه‌های مجازِ یک ستون برای مدل — همان کرکره‌ی خودِ شیت."""
+    if spec.options:
+        return list(spec.options)
+    vocabulary = vocabulary_for(spec, options)
+    return list(vocabulary.options or ())
+
+
+def _same_book(
+    pages: list[PageDetails], row: gsheet.SheetRow, job: _Job, wanted: Sequence[str] = ()
+) -> tuple[list[PageDetails], list[PageDetails]]:
+    """صفحه‌هایی که درباره‌ی **همین** کتاب‌اند، جدا از کتابِ هم‌نام.
+
+    عنوانِ یکسان کافی نیست: «رمان شب بی‌ستاره» را دو نویسنده نوشته‌اند و
+    صفحه‌ی هرکدام عنوانِ دیگری را هم می‌خواند. نویسنده تنها چیزی است که
+    بین دو کتابِ هم‌نام فرق می‌گذارد، پس:
+
+    ۱. اگر ستون نویسنده در شیت **پر است**، همان مرجع است — این قطعی‌ترین
+       حالت و همان چیزی که کاربر دستی می‌داند.
+    ۲. وگرنه اکثریتِ منابع مرجع‌اند: اگر سه سایت نویسنده‌ای را گفته‌اند و
+       یکی چیز دیگری، آن یکی درباره‌ی کتاب دیگری حرف می‌زند.
+
+    صفحه‌ای که اصلاً نویسنده اعلام نکرده کنار نمی‌رود؛ نگفتن، مخالفت نیست.
+    """
+    named = [page for page in pages if page.authors]
+    # اگر قرار است همین اجرا ستون نویسنده را بنویسد، مقدارِ فعلی‌اش مرجع نیست
+    written = row.values.get("author", "") if "author" not in wanted else ""
+    if len(pages) < 2 and not written:
+        return pages, []
+
+    stated = _author_keys(written, job)
+    expected = stated
+    if not expected:
+        if len(named) < 3:
+            # با دو منبع نمی‌شود فهمید کدام اکثریت است
+            return pages, []
+        votes: dict[str, int] = {}
+        for page in named:
+            for key in _author_keys(" | ".join(page.authors), job):
+                votes[key] = votes.get(key, 0) + 1
+        if not votes:
+            return pages, []
+        best = max(votes.values())
+        if best < 2 or best == len(named):
+            return pages, []          # یا اکثریتی نیست، یا همه موافق‌اند
+        expected = {key for key, count in votes.items() if count == best}
+
+    keep, dropped = [], []
+    for page in pages:
+        keys = _author_keys(" | ".join(page.authors), job)
+        (keep if not keys or keys & expected else dropped).append(page)
+    # هیچ منبعی با مرجع نخواند: این ردیف را خالی نمی‌کنیم. شاید املای نامِ
+    # شیت با منابع فرق دارد. همه را نگه می‌داریم و شک را گزارش می‌کنیم.
+    return (keep, dropped) if keep else (pages, [])
+
+
+def _author_keys(text: str, job: _Job) -> set[str]:
+    """نامِ نویسنده → کلیدهای مقایسه.
+
+    نام فامیل به‌تنهایی هم کلید است: یک سایت «جوجو مویز» می‌نویسد و دیگری
+    «مویز»؛ این‌ها یک نفرند و نباید ناهم‌خوان شمرده شوند.
+    """
+    keys: set[str] = set()
+    for chunk in str(text or "").replace("|", "،").split("،"):
+        for name in details.clean_persons(chunk):
+            whole = normalizer.normalize(name, job.norm_config)
+            if not whole:
+                continue
+            keys.add(whole)
+            parts = whole.split()
+            if len(parts) > 1:
+                keys.add(parts[-1])
+    return keys
 
 
 def _drop_contradicting_terms(terms: Sequence[str], nationality: str) -> list[str]:
@@ -680,13 +923,20 @@ def process_row(job: _Job, row: gsheet.SheetRow, row_id: int, wanted: list[str])
         )
         return
 
+    # صفحه‌ای که نویسنده‌اش با بقیه نمی‌خواند، احتمالاً کتابِ هم‌نامِ دیگری است
+    pages, dropped = _same_book(pages, row, job, wanted)
+    if dropped:
+        stats.mismatched_sources += len(dropped)
+        job.say(f"  ردیف {row.number}: {len(dropped)} منبع به‌خاطر ناهم‌خوانی نویسنده کنار رفت")
+
     # وقتی ستون تصویری در کار نیست، دنبال کاور نمی‌گردیم: هر کاندید یعنی چند
     # درخواست اضافه برای چیزی که قرار نیست نوشته شود.
     wants_image = any(spec.kind == fields.KIND_IMAGE for spec in job.specs)
     pick = _pick_image(pages, options, job.fetcher) if wants_image else images.ImagePick()
-    values, evidence, _ = build_values(
+    values, evidence, common = build_values(
         row.title, pages, options, job.specs, job.norm_config, image_pick=pick
     )
+    pages = _ai_review(job, row, pages, wanted, values, evidence, common, pick)
 
     missing = [
         spec.key
@@ -757,6 +1007,32 @@ def finish(job: _Job) -> FillStats:
     return stats
 
 
+def progress_line(done: int, total: int, started: float, cells: int) -> str:
+    """«۴۰٪ — ۸/۲۰ ردیف، ۳۱ سلول، ~۲ دقیقه مانده».
+
+    بدون این خط، اجرای چندساعته یک پنجره‌ی ساکت است و آدم نمی‌داند تمام
+    می‌شود یا گیر کرده.
+    """
+    percent = int(round(100 * done / total)) if total else 100
+    bits = [f"{percent}٪ — {done}/{total} ردیف", f"{cells} سلول"]
+    spent = time.monotonic() - started
+    if done and spent > 5:
+        left = spent / done * (total - done)
+        if left >= 1:
+            bits.append(f"~{human_time(left)} مانده")
+    return "  " + "، ".join(bits)
+
+
+def human_time(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds} ثانیه"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} دقیقه"
+    hours, minutes = divmod(round(seconds / 60), 60)
+    return f"{hours} ساعت و {minutes} دقیقه" if minutes else f"{hours} ساعت"
+
+
 def run(
     conn: sqlite3.Connection,
     config: Config,
@@ -765,10 +1041,16 @@ def run(
     document: gsheet.Document | None = None,
     log: LogFn | None = None,
     should_stop: Callable[[], bool] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> FillStats:
-    """پر کردن شیت — یک بار، از اول تا آخر."""
+    """پر کردن شیت — یک بار، از اول تا آخر.
+
+    ``on_progress(done, total)`` بعد از هر ردیف صدا زده می‌شود تا پنل بتواند
+    نوار پیشرفت را بکشد، بدون اینکه مجبور باشد لاگ را parse کند.
+    """
     say: LogFn = log or print
     stop = should_stop or (lambda: False)
+    tick = on_progress or (lambda done, total: None)
 
     job = prepare(conn, config, options, fetcher, document, say)
     recovered = _push_unwritten(job)
@@ -777,17 +1059,20 @@ def run(
         say(f"{recovered} سلول از اجرای قبلی که به شیت نرسیده بود، نوشته شد.")
 
     queue = build_queue(job)
+    tick(0, len(queue))
+    started = time.monotonic()
     try:
         for index, (row, row_id, wanted) in enumerate(queue, start=1):
             if stop():
                 job.stats.stopped_early = "به درخواست شما متوقف شد؛ بقیه‌ی ردیف‌ها در صف ماندند."
                 break
             _process_safely(job, row, row_id, wanted)
+            tick(index, len(queue))
             if len(job.ids) >= options.batch_rows:
                 job.stats.cells_written += _flush(conn, job.document, job.updates, job.ids)
                 job.updates, job.ids = [], []
-            if index % 10 == 0:
-                say(f"  {index}/{len(queue)} — نوشته‌شده: {job.stats.cells_written} سلول")
+            if index % 5 == 0 or index == len(queue):
+                say(progress_line(index, len(queue), started, job.stats.cells_written))
     except KeyboardInterrupt:
         job.stats.stopped_early = "با Ctrl+C متوقف شد؛ آنچه تا اینجا جمع شده نوشته می‌شود."
     finally:
@@ -828,6 +1113,7 @@ def run_auto(
     should_stop: Callable[[], bool] | None = None,
     sleep: Callable[[float], None] | None = None,
     rounds: int = 0,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> FillStats:
     """حالت خودکار: پر کن، بخواب، دوباره شیت را بخوان.
 
@@ -837,8 +1123,6 @@ def run_auto(
 
     ``rounds`` صفر یعنی بی‌نهایت (تا وقتی لغو شود)؛ عدد مثبت برای تست.
     """
-    import time
-
     say: LogFn = log or print
     stop = should_stop or (lambda: False)
     nap = sleep or time.sleep
@@ -850,7 +1134,10 @@ def run_auto(
         fetcher = fetcher_factory()
         stats = None
         try:
-            stats = run(conn, config, options, fetcher, log=say, should_stop=stop)
+            stats = run(
+                conn, config, options, fetcher, log=say, should_stop=stop,
+                on_progress=on_progress,
+            )
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -890,6 +1177,10 @@ def _accumulate(total: FillStats, stats: FillStats) -> None:
         "no_source",
         "already_filled",
         "failed",
+        "mismatched_sources",
+        "ai_reviewed",
+        "ai_changed",
+        "ai_failed",
         "pages_fetched",
         "from_cache",
         "cells_written",

@@ -63,3 +63,16 @@ crawl:
 #   require_square: true
 #   prefer_domains: []          # دامنه‌هایی که کاور تمیز دارند
 #   block_domains: []           # دامنه‌هایی که همیشه واترمارک می‌زنند
+
+# بازبینِ هوش مصنوعی — پیش‌فرض خاموش. همه‌چیزِ روزمره‌اش از پنل تنظیم می‌شود؛
+# این‌ها فقط تنظیم‌های ریزند.
+# ai:
+#   enabled: false
+#   provider: local           # local (Ollama، رایگان) | openrouter | claude
+#   model: "qwen3:8b"         # فهرست OpenRouter: run.py models --free
+#   base_url: "http://127.0.0.1:11434"
+#   api_key: ""               # خالی = از OPENROUTER_API_KEY یا ANTHROPIC_API_KEY
+#   scope: uncertain          # uncertain (فقط جایی که قواعد گیر کرده) | all
+#   min_confidence: 0.6       # کمتر از این، جوابِ مدل نوشته نمی‌شود
+#   max_sources: 4            # چند منبع به مدل داده شود (سقفِ هزینه)
+#   max_chars_per_source: 2500

@@ -42,7 +42,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):  # pragma: no cover — استریم غیرعادی
         pass
 
-from .core import db, filler, gsheet, http, normalizer, sources
+from .core import ai, db, filler, gsheet, http, normalizer, sources
 from .core.config import Config, ConfigError, load_config
 
 app = typer.Typer(
@@ -207,6 +207,40 @@ def links_command(
     typer.secho(f"{titles} عنوان و {links} آدرس ثبت شد.", fg=typer.colors.GREEN)
     typer.echo(f"مجموع آدرس‌های ذخیره‌شده: {db.link_count(context.conn)}")
     context.close()
+
+
+@app.command("models")
+def models_command(
+    key: Optional[str] = typer.Option(None, "--key", help="کلید OpenRouter؛ خالی = از محیط"),
+    free_only: bool = typer.Option(False, "--free", help="فقط مدل‌های رایگان"),
+    search: Optional[str] = typer.Option(None, "--search", "-s", help="فیلتر روی نام مدل"),
+    limit: int = typer.Option(30, "--limit", "-n"),
+) -> None:
+    """فهرست **زنده**‌ی مدل‌های OpenRouter — رایگان‌ها اول، بعد ارزان‌ترها.
+
+    اسم و قیمتِ مدل‌ها مدام عوض می‌شود، پس هیچ فهرستی داخل برنامه ذخیره
+    نشده؛ همیشه از خود سرویس پرسیده می‌شود.
+    """
+    try:
+        rows = ai.openrouter_models(key or "")
+    except ai.AIError as exc:
+        _fail(str(exc))
+        return
+    if free_only:
+        rows = [row for row in rows if row["free"]]
+    if search:
+        needle = search.strip().lower()
+        rows = [row for row in rows if needle in row["id"].lower() or needle in row["name"].lower()]
+    if not rows:
+        typer.echo("مدلی پیدا نشد.")
+        return
+    typer.echo(f"{len(rows)} مدل — قیمت به دلار برای هر یک میلیون توکن (ورودی/خروجی)\n")
+    for row in rows[:limit]:
+        price = "رایگان" if row["free"] else f'{row["in_per_m"]:g} / {row["out_per_m"]:g}'
+        typer.echo(f"  {row['id']:<48} {price}")
+    if len(rows) > limit:
+        typer.echo(f"\n… و {len(rows) - limit} مدل دیگر (--limit را بیشتر کنید)")
+    typer.echo("\nنام مدل را در پنل، در «نام مدل» بگذارید.")
 
 
 @app.command("status")
