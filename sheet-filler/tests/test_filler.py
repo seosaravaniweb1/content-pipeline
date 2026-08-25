@@ -472,6 +472,51 @@ def test_status_and_product_id_are_never_writable(env):
     assert "status" not in keys and "product_id" not in keys and "title" not in keys
 
 
+def test_the_panel_finds_a_port_even_when_windows_reserved_the_usual_ones(tmp_path):
+    """ویندوز ۱۱ محدوده‌هایی را برای Hyper-V رزرو می‌کند و bind شکست می‌خورد.
+
+    پنل نباید با پیام «پورت در دسترس نیست» تمام شود؛ باید پورت آزادی پیدا کند.
+    """
+    import socket
+    from sheet_filler.run import app
+    from sheet_filler.core.config import load_config
+
+    blocked = []
+    for port in [*range(8050, 8060), *range(8770, 8775), *range(9250, 9255)]:
+        sock = socket.socket()
+        try:
+            sock.bind(("127.0.0.1", port))
+            sock.listen(1)
+            blocked.append(sock)
+        except OSError:
+            sock.close()
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"database:\n  path: {tmp_path / 'p.db'}\n", encoding="utf-8"
+    )
+    started: list[int] = []
+    real = web_server.build_server
+
+    def spy(*args, **kwargs):
+        httpd, state = real(*args, **kwargs)
+        started.append(httpd.server_address[1])
+        httpd.server_close()
+        raise KeyboardInterrupt      # همین که بالا آمد کافی است
+    try:
+        web_server.build_server = spy
+        try:
+            app(["panel", "--no-browser", "-c", str(config_path)], standalone_mode=False)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        web_server.build_server = real
+        for sock in blocked:
+            sock.close()
+
+    assert started and started[-1] > 0     # پورتی پیدا شد
+
+
 def test_panel_settings_override_the_config_file(env):
     _, config = env
     config.raw["fill"]["max_sources_per_title"] = 2

@@ -280,7 +280,14 @@ def panel_command(
         return
     db.connect(configuration.db_path).close()
 
-    candidates = [port] if port is not None else list(range(8050, 8060))
+    # ویندوز ۱۱ محدوده‌هایی از پورت‌ها را برای Hyper-V/WSL/Docker رزرو می‌کند و
+    # bind روی آن‌ها WinError 10013 می‌دهد — «اشغال» نیست، «ممنوع» است. کدام
+    # محدوده هم روی هر دستگاه فرق دارد. پس چند محدوده‌ی پراکنده امتحان می‌شود
+    # و در آخر پورت ۰ که یعنی «هر پورت آزادی که خودت داری» و هیچ‌وقت رد نمی‌شود.
+    if port is not None:
+        candidates = [port, 0]
+    else:
+        candidates = [*range(8050, 8060), *range(8770, 8775), *range(9250, 9255), 0]
     httpd = state = None
     last_error: OSError | None = None
     for candidate in candidates:
@@ -290,8 +297,18 @@ def panel_command(
         except OSError as exc:
             last_error = exc
     if httpd is None or state is None:
-        _fail(f"پورت در دسترس نیست ({last_error}). با --port پورت دیگری بدهید.")
+        _fail(
+            f"هیچ پورتی بالا نیامد ({last_error}).\n"
+            "  اگر ویندوز دارید، محدوده‌های رزروشده را ببینید:\n"
+            "    netsh interface ipv4 show excludedportrange protocol=tcp"
+        )
         return
+    chosen = httpd.server_address[1]
+    if port is not None and chosen != port:
+        typer.secho(
+            f"⚠ پورت {port} در دسترس نبود (ویندوز رزروش کرده)؛ روی {chosen} بالا آمد.",
+            fg=typer.colors.YELLOW,
+        )
 
     url = web_server.url_for(httpd, state.token)
     typer.secho("پنل تکمیل گوگل‌شیت بالا آمد:", fg=typer.colors.GREEN, bold=True)

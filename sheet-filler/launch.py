@@ -64,7 +64,7 @@ def ensure_config() -> Path | None:
         return None
     shutil.copyfile(example, config)
     say(f"+ فایل تنظیمات ساخته شد: {config}")
-    say("  سایت‌های رقیب و موضوع هدف را از تب «تنظیمات» همان پنل پر کنید.")
+    say("  آدرس گوگل‌شیت و سایت‌های منبع را در همان پنل، تبِ «شروع» پر کنید.")
     return config
 
 
@@ -74,7 +74,7 @@ def main() -> int:
 
     say()
     say("=" * 46)
-    say("   پنل مدیریت خوراک محتوایی")
+    say("   پنل تکمیل گوگل‌شیت")
     say("=" * 46)
     say()
 
